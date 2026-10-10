@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: ./.github/actions/setup-nginx
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (without the ngx_modules export table)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  test:
+    name: test (nginx ${{ matrix.nginx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx: ["1.28.3", "1.30.5", "1.31.6"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-nginx
+        with:
+          version: ${{ matrix.nginx }}
+          build: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nginx-${{ matrix.nginx }}
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Build module
+        run: cargo build --release
+
+      - name: Check out nginx-tests
+        uses: actions/checkout@v7
+        with:
+          repository: nginx/nginx-tests
+          path: nginx-tests
+
+      - name: Install the brotli CLI
+        run: sudo apt-get install -y -qq --no-install-recommends brotli
+
+      - name: Integration tests
+        env:
+          TEST_NGINX_BINARY: ${{ env.NGINX_BINARY }}
+        run: |
+          export TEST_NGINX_GLOBALS="load_module $PWD/target/release/libngx_mbrotli.so;"
+          prove -v -I nginx-tests/lib t/
+
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: ./.github/actions/setup-nginx
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri setup
+      - run: cargo miri test

@@ -1,0 +1,55 @@
+name: Set up NGINX
+description: >
+  Downloads and configures an NGINX source tree for nginx-sys bindings and,
+  optionally, builds the binary for integration tests. Exports
+  NGINX_BUILD_DIR and NGINX_BINARY.
+
+inputs:
+  version:
+    description: NGINX version to build against.
+    default: "1.30.5"
+  build:
+    description: Also run `make`, producing an nginx binary.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends \
+          libclang-dev libpcre2-dev zlib1g-dev libssl-dev
+
+    - name: Restore NGINX
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/nginx-${{ inputs.version }}
+        key: nginx-${{ inputs.version }}-build-${{ inputs.build }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-nginx/action.yml') }}
+
+    - name: Download and configure NGINX
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        VERSION: ${{ inputs.version }}
+        BUILD: ${{ inputs.build }}
+      run: |
+        set -euo pipefail
+        curl -sSfL "https://nginx.org/download/nginx-$VERSION.tar.gz" | tar xz
+        cd "nginx-$VERSION"
+        ./configure --with-compat --with-debug --with-http_ssl_module
+        if [ "$BUILD" = true ]; then
+          make -j"$(nproc)"
+        fi
+
+    - name: Export paths
+      shell: bash
+      env:
+        DIR: ${{ runner.temp }}/nginx-${{ inputs.version }}
+      run: |
+        dir="$DIR"
+        echo "NGINX_BUILD_DIR=$dir/objs" >> "$GITHUB_ENV"
+        echo "NGINX_BINARY=$dir/objs/nginx" >> "$GITHUB_ENV"
