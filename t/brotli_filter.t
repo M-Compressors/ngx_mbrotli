@@ -19,7 +19,7 @@ use Test::Nginx qw/ :DEFAULT http_content /;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http proxy ssi gzip/)->has_daemon('brotli')->plan(35)
+my $t = Test::Nginx->new()->has(qw/http proxy ssi gzip/)->has_daemon('brotli')->plan(45)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -80,6 +80,33 @@ http {
         location /min/ {
             alias %%TESTDIR%%/;
             brotli_min_length 1000;
+        }
+
+        location /noreuse/ {
+            alias %%TESTDIR%%/;
+            brotli_reuse_memory off;
+        }
+
+        location /aggressive/ {
+            alias %%TESTDIR%%/;
+            brotli_retention_policy aggressive;
+        }
+
+        location /current_config/ {
+            alias %%TESTDIR%%/;
+            brotli_retention_policy current_config;
+            brotli_comp_level 9;
+        }
+
+        location /release_all/ {
+            alias %%TESTDIR%%/;
+            brotli_retention_policy release_all;
+        }
+
+        location /bounded/ {
+            alias %%TESTDIR%%/;
+            brotli_retention_policy bounded 64k;
+            brotli_comp_level 11;
         }
 
         location /proxy/ {
@@ -205,6 +232,16 @@ like($r, qr/^Content-Encoding: br/mi, 'if: brotli inherited');
 
 $r = get('/cond/index.html?nobr=1', 'br');
 unlike($r, qr/^Content-Encoding/mi, 'if: brotli off');
+
+# memory reuse and retention policies: each request twice, so that the
+# second one gets an encoder returned to the cache by the first
+
+for my $prefix (qw/noreuse aggressive current_config release_all bounded/) {
+	for my $n (1, 2) {
+		$r = get("/$prefix/index.html", 'br');
+		is(br_body($r), $html, "$prefix $n");
+	}
+}
 
 # response kinds
 

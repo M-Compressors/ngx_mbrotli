@@ -2,7 +2,9 @@
 //!
 //! NGINX runs filters on a single thread per worker process, so a thread-local
 //! free list lets consecutive responses reuse an encoder's window, match finder
-//! and staging buffers instead of allocating them for every request.
+//! and staging buffers instead of allocating them for every request
+//! (`brotli_reuse_memory`). How much an idle encoder keeps allocated is its
+//! retention policy (`brotli_retention_policy`).
 
 use core::cell::RefCell;
 
@@ -11,24 +13,40 @@ use mbrotli::{Compressor, ConfigError, EncoderConfig, RetentionPolicy};
 /// How many idle compressors a worker keeps.
 const MAX_IDLE: usize = 4;
 
-/// How much memory a single idle compressor may keep allocated.
+/// The default retention policy: keep up to 8 MiB per idle compressor.
 ///
 /// Encoders whose working set grows past this (high qualities with large
 /// windows) release it after every stream, as they would without the cache.
-const MAX_RETAINED_BYTES: usize = 8 << 20;
+pub const DEFAULT_RETENTION: RetentionPolicy = RetentionPolicy::Bounded { max_bytes: 8 << 20 };
 
 thread_local! {
+    /// Idle compressors, least recently released first.
     static IDLE: RefCell<Vec<Compressor>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Returns a compressor for `config`, preferring an idle one.
-pub fn acquire(config: EncoderConfig) -> Result<Compressor, ConfigError> {
+/// Builds a compressor that bypasses the cache.
+pub fn build(config: EncoderConfig, retention: RetentionPolicy) -> Result<Compressor, ConfigError> {
+    Compressor::builder(config)
+        .with_retention(retention)
+        .build()
+}
+
+/// Returns a compressor for `config` and `retention`, preferring an idle one.
+///
+/// A compressor's retention policy is fixed when it is built, so only idle
+/// compressors with the same policy are reused; one built for another encoder
+/// configuration is reconfigured.
+pub fn acquire(
+    config: EncoderConfig,
+    retention: RetentionPolicy,
+) -> Result<Compressor, ConfigError> {
     let cached = IDLE.with_borrow_mut(|idle| {
+        let same_policy = |c: &Compressor| c.retention() == retention;
         let index = idle
             .iter()
-            .rposition(|c| *c.config() == config)
-            .or_else(|| idle.len().checked_sub(1))?;
-        Some(idle.swap_remove(index))
+            .rposition(|c| same_policy(c) && *c.config() == config)
+            .or_else(|| idle.iter().rposition(same_policy))?;
+        Some(idle.remove(index))
     });
 
     match cached {
@@ -38,28 +56,26 @@ pub fn acquire(config: EncoderConfig) -> Result<Compressor, ConfigError> {
             }
             Ok(compressor)
         }
-        None => Compressor::builder(config)
-            .with_retention(RetentionPolicy::Bounded {
-                max_bytes: MAX_RETAINED_BYTES,
-            })
-            .build(),
+        None => build(config, retention),
     }
 }
 
-/// Returns `compressor` to the cache, or drops it when the cache is full.
+/// Returns `compressor` to the cache, evicting the least recently released
+/// idle compressor when the cache is full.
 pub fn release(compressor: Compressor) {
     IDLE.with_borrow_mut(|idle| {
-        if idle.len() < MAX_IDLE {
-            idle.push(compressor);
+        if idle.len() >= MAX_IDLE {
+            idle.remove(0);
         }
+        idle.push(compressor);
     });
 }
 
 #[cfg(test)]
 mod tests {
-    use mbrotli::{EncoderConfig, Operation, Quality, Window};
+    use mbrotli::{EncoderConfig, Operation, Quality, RetentionPolicy, Window};
 
-    use super::{MAX_IDLE, acquire, release};
+    use super::{DEFAULT_RETENTION, IDLE, MAX_IDLE, acquire, release};
 
     fn config(quality: Quality, bits: u8) -> EncoderConfig {
         EncoderConfig::default()
@@ -68,7 +84,7 @@ mod tests {
     }
 
     fn compress(config: EncoderConfig, input: &[u8]) -> Vec<u8> {
-        let mut session = acquire(config)
+        let mut session = acquire(config, DEFAULT_RETENTION)
             .unwrap()
             .into_session(Default::default())
             .unwrap();
@@ -77,6 +93,10 @@ mod tests {
         out.truncate(progress.produced);
         release(session.into_compressor());
         out
+    }
+
+    fn idle_policies() -> Vec<RetentionPolicy> {
+        IDLE.with_borrow(|idle| idle.iter().map(|c| c.retention()).collect())
     }
 
     #[test]
@@ -95,10 +115,39 @@ mod tests {
     #[test]
     fn idle_list_is_bounded() {
         let held: Vec<_> = (0..MAX_IDLE + 3)
-            .map(|_| acquire(config(Quality::Q1, 16)).unwrap())
+            .map(|_| acquire(config(Quality::Q1, 16), DEFAULT_RETENTION).unwrap())
             .collect();
         held.into_iter().for_each(release);
 
-        super::IDLE.with_borrow(|idle| assert_eq!(idle.len(), MAX_IDLE));
+        assert_eq!(idle_policies().len(), MAX_IDLE);
+    }
+
+    #[test]
+    fn compressors_keep_the_requested_retention_policy() {
+        let q1 = config(Quality::Q1, 16);
+        release(acquire(q1, RetentionPolicy::ReleaseAll).unwrap());
+
+        // An idle compressor with another policy is not handed out...
+        let aggressive = acquire(q1, RetentionPolicy::Aggressive).unwrap();
+        assert_eq!(aggressive.retention(), RetentionPolicy::Aggressive);
+        assert_eq!(idle_policies(), [RetentionPolicy::ReleaseAll]);
+
+        // ...but the matching one is.
+        let release_all = acquire(q1, RetentionPolicy::ReleaseAll).unwrap();
+        assert_eq!(release_all.retention(), RetentionPolicy::ReleaseAll);
+        assert!(idle_policies().is_empty());
+    }
+
+    #[test]
+    fn a_full_cache_evicts_the_least_recently_released() {
+        let q1 = config(Quality::Q1, 16);
+        release(acquire(q1, RetentionPolicy::ReleaseAll).unwrap());
+
+        let held: Vec<_> = (0..MAX_IDLE)
+            .map(|_| acquire(q1, RetentionPolicy::Aggressive).unwrap())
+            .collect();
+        held.into_iter().for_each(release);
+
+        assert_eq!(idle_policies(), [RetentionPolicy::Aggressive; MAX_IDLE]);
     }
 }

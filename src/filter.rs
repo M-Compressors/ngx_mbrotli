@@ -8,15 +8,15 @@ use core::{ptr, slice};
 
 use mbrotli::{
     EncodeError, EncoderConfig, EncoderSessionOwned, EncoderStatus, InputSize, Operation, Quality,
-    StreamConfig, Window,
+    RetentionPolicy, StreamConfig, Window,
 };
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, Pool};
 use ngx::ffi::{
-    NGX_AGAIN, NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_ERROR,
-    NGX_HTTP_FORBIDDEN, NGX_HTTP_GZIP_BUFFERED, NGX_HTTP_LIF_CONF, NGX_HTTP_LOC_CONF,
+    NGX_AGAIN, NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12,
+    NGX_ERROR, NGX_HTTP_FORBIDDEN, NGX_HTTP_GZIP_BUFFERED, NGX_HTTP_LIF_CONF, NGX_HTTP_LOC_CONF,
     NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MODULE, NGX_HTTP_NOT_FOUND, NGX_HTTP_OK,
-    NGX_HTTP_SRV_CONF, NGX_LOG_ALERT, NGX_OK, ngx_alloc_chain_link, ngx_array_t, ngx_buf_t,
-    ngx_bufs_t, ngx_chain_add_copy, ngx_chain_t, ngx_chain_update_chains, ngx_command_t,
+    NGX_HTTP_SRV_CONF, NGX_LOG_ALERT, NGX_LOG_EMERG, NGX_OK, ngx_alloc_chain_link, ngx_array_t,
+    ngx_buf_t, ngx_bufs_t, ngx_chain_add_copy, ngx_chain_t, ngx_chain_update_chains, ngx_command_t,
     ngx_conf_check_num_bounds, ngx_conf_num_bounds_t, ngx_conf_post_t, ngx_conf_set_bufs_slot,
     ngx_conf_set_flag_slot, ngx_conf_set_num_slot, ngx_conf_set_size_slot, ngx_conf_t,
     ngx_create_temp_buf, ngx_flag_t, ngx_hash_t, ngx_http_add_variable,
@@ -24,9 +24,10 @@ use ngx::ffi::{
     ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
     ngx_http_test_content_type, ngx_http_top_body_filter, ngx_http_top_header_filter,
     ngx_http_types_slot, ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_module_t,
-    ngx_pagesize, ngx_pcalloc, ngx_pnalloc, ngx_pool_t, ngx_table_elt_t, ngx_uint_t, off_t,
+    ngx_pagesize, ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t, ngx_str_t,
+    ngx_table_elt_t, ngx_uint_t, off_t,
 };
-use ngx::{ngx_log_debug_mask, ngx_log_error, ngx_string};
+use ngx::{ngx_conf_log_error, ngx_log_debug_mask, ngx_log_error, ngx_string};
 
 use crate::accept_encoding;
 use crate::bitfields::{
@@ -59,6 +60,9 @@ struct FilterConf {
     bufs: ngx_bufs_t,
     quality: ngx_int_t,
     lg_win: usize,
+    reuse_memory: ngx_flag_t,
+    /// `None` until `brotli_retention_policy` is set or merged.
+    retention: Option<RetentionPolicy>,
 }
 
 static mut COMP_LEVEL_BOUNDS: ngx_conf_num_bounds_t = ngx_conf_num_bounds_t {
@@ -73,7 +77,7 @@ static mut WINDOW_POST: ngx_conf_post_t = ngx_conf_post_t {
 
 const ANY_CONF: u32 = NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF;
 
-static mut COMMANDS: [ngx_command_t; 7] = [
+static mut COMMANDS: [ngx_command_t; 9] = [
     ngx_command_t {
         name: ngx_string!("brotli"),
         type_: (ANY_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG) as ngx_uint_t,
@@ -120,6 +124,22 @@ static mut COMMANDS: [ngx_command_t; 7] = [
         set: Some(ngx_conf_set_size_slot),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: core::mem::offset_of!(FilterConf, min_length),
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("brotli_reuse_memory"),
+        type_: (ANY_CONF | NGX_CONF_FLAG) as ngx_uint_t,
+        set: Some(ngx_conf_set_flag_slot),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: core::mem::offset_of!(FilterConf, reuse_memory),
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("brotli_retention_policy"),
+        type_: (ANY_CONF | NGX_CONF_TAKE12) as ngx_uint_t,
+        set: Some(set_retention_policy),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
         post: ptr::null_mut(),
     },
     ngx_command_t::empty(),
@@ -283,6 +303,8 @@ enum Step {
 struct FilterCtx {
     request: *mut ngx_http_request_t,
     session: Option<EncoderSessionOwned>,
+    /// Whether the encoder goes back to the per-worker cache when done.
+    reuse_memory: bool,
     content_length: off_t,
 
     /// Input not yet handed to the encoder.
@@ -323,6 +345,7 @@ impl FilterCtx {
         Self {
             request,
             session: None,
+            reuse_memory: false,
             content_length,
             input: ptr::null_mut(),
             in_buf: ptr::null_mut(),
@@ -361,7 +384,9 @@ impl FilterCtx {
     }
 
     fn release_encoder(&mut self) {
-        if let Some(session) = self.session.take() {
+        if let Some(session) = self.session.take()
+            && self.reuse_memory
+        {
             encoder_pool::release(session.into_compressor());
         }
     }
@@ -470,6 +495,9 @@ impl FilterCtx {
             conf.lg_win
         };
 
+        let reuse_memory = conf.reuse_memory != 0;
+        let retention = conf.retention.unwrap_or(encoder_pool::DEFAULT_RETENTION);
+
         let compressor = Quality::try_from(conf.quality as u8)
             .and_then(|quality| Ok((quality, Window::standard(window_bits as u8)?)))
             .map(|(quality, window)| {
@@ -477,7 +505,13 @@ impl FilterCtx {
                     .with_quality(quality)
                     .with_window(window)
             })
-            .and_then(encoder_pool::acquire)
+            .and_then(|config| {
+                if reuse_memory {
+                    encoder_pool::acquire(config, retention)
+                } else {
+                    encoder_pool::build(config, retention)
+                }
+            })
             .map_err(|err| {
                 ngx_log_error!(
                     NGX_LOG_ALERT,
@@ -497,13 +531,16 @@ impl FilterCtx {
             .into_session(StreamConfig::from(input_size))
             .map_err(|err| self.encode_error(&err))?;
         self.session = Some(session);
+        self.reuse_memory = reuse_memory;
 
         ngx_log_debug_mask!(
             DebugMask::Http,
             self.log(),
-            "brotli encoder initialized: lvl:{} win:{}",
+            "brotli encoder initialized: lvl:{} win:{} reuse:{} retention:{:?}",
             conf.quality,
-            1usize << window_bits
+            1usize << window_bits,
+            reuse_memory,
+            retention
         );
 
         Ok(())
@@ -758,13 +795,21 @@ unsafe fn free_chain(pool: *mut ngx_pool_t, cl: *mut ngx_chain_t) {
 }
 
 unsafe extern "C" fn create_conf(cf: *mut ngx_conf_t) -> *mut c_void {
-    let conf: *mut FilterConf = unsafe { ngx_pcalloc((*cf).pool, size_of::<FilterConf>()) }.cast();
-    if let Some(conf) = unsafe { conf.as_mut() } {
-        // Zeroed: types, types_keys and bufs.
-        conf.enable = UNSET;
-        conf.quality = UNSET;
-        conf.lg_win = UNSET_SIZE;
-        conf.min_length = UNSET;
+    let conf: *mut FilterConf = unsafe { ngx_palloc((*cf).pool, size_of::<FilterConf>()) }.cast();
+    if !conf.is_null() {
+        unsafe {
+            conf.write(FilterConf {
+                enable: UNSET,
+                types: core::mem::zeroed(),
+                types_keys: ptr::null_mut(),
+                min_length: UNSET,
+                bufs: ngx_bufs_t { num: 0, size: 0 },
+                quality: UNSET,
+                lg_win: UNSET_SIZE,
+                reuse_memory: UNSET,
+                retention: None,
+            })
+        };
     }
     conf.cast()
 }
@@ -787,6 +832,11 @@ unsafe extern "C" fn merge_conf(
     merge(&mut conf.quality, prev.quality, UNSET, 6);
     merge(&mut conf.lg_win, prev.lg_win, UNSET_SIZE, 19);
     merge(&mut conf.min_length, prev.min_length, UNSET, 20);
+    merge(&mut conf.reuse_memory, prev.reuse_memory, UNSET, 1);
+    conf.retention = conf
+        .retention
+        .or(prev.retention)
+        .or(Some(encoder_pool::DEFAULT_RETENTION));
 
     if conf.bufs.num == 0 {
         conf.bufs = if prev.bufs.num != 0 {
@@ -814,6 +864,74 @@ unsafe extern "C" fn merge_conf(
         return NGX_CONF_ERROR;
     }
 
+    NGX_CONF_OK
+}
+
+/// `brotli_retention_policy aggressive | current_config | release_all | bounded <size>`.
+unsafe extern "C" fn set_retention_policy(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *conf.cast::<FilterConf>() };
+    if conf.retention.is_some() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+
+    let args: &mut [ngx_str_t] = unsafe { (*(*cf).args).as_slice_mut() };
+    let (name, size) = match args {
+        [_, name] => (*name, None),
+        [_, name, size] => (*name, Some(size)),
+        _ => return NGX_CONF_ERROR,
+    };
+
+    let policy = match (name.as_bytes(), size) {
+        (b"aggressive", None) => RetentionPolicy::Aggressive,
+        (b"current_config", None) => RetentionPolicy::CurrentConfig,
+        (b"release_all", None) => RetentionPolicy::ReleaseAll,
+        (b"bounded", Some(size)) => {
+            let max_bytes = unsafe { ngx_parse_size(size) };
+            if max_bytes == NGX_ERROR as isize {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "invalid size \"{size}\" in \"brotli_retention_policy\" directive"
+                );
+                return NGX_CONF_ERROR;
+            }
+            RetentionPolicy::Bounded {
+                max_bytes: max_bytes as usize,
+            }
+        }
+        (b"bounded", None) => {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "\"bounded\" in \"brotli_retention_policy\" directive requires a size"
+            );
+            return NGX_CONF_ERROR;
+        }
+        (b"aggressive" | b"current_config" | b"release_all", Some(_)) => {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "\"{name}\" in \"brotli_retention_policy\" directive does not take a size"
+            );
+            return NGX_CONF_ERROR;
+        }
+        _ => {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "invalid value \"{name}\" in \"brotli_retention_policy\" directive, \
+                 it must be \"aggressive\", \"current_config\", \"release_all\" \
+                 or \"bounded <size>\""
+            );
+            return NGX_CONF_ERROR;
+        }
+    };
+
+    conf.retention = Some(policy);
     NGX_CONF_OK
 }
 

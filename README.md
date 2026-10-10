@@ -109,6 +109,44 @@ When the response length is known, a smaller window is used if it is enough.
 Sets the minimum length of a response that will be compressed. The length comes
 only from the `Content-Length` response header.
 
+### `brotli_reuse_memory`
+
+- **syntax**: `brotli_reuse_memory on|off`
+- **default**: `on`
+- **context**: `http`, `server`, `location`
+
+Enables or disables reusing encoders between responses. When on, each worker
+keeps up to 4 idle encoders, so a response can reuse the window, match finder and
+buffers a previous one allocated. How much memory an idle encoder keeps is set by
+`brotli_retention_policy`. When off, every response gets a new encoder that is
+freed when the response is complete, as with google/ngx_brotli.
+
+*Not in google/ngx_brotli.*
+
+### `brotli_retention_policy`
+
+- **syntax**: `brotli_retention_policy aggressive | current_config | release_all | bounded <size>`
+- **default**: `bounded 8m`
+- **context**: `http`, `server`, `location`
+
+Sets how much working memory an encoder keeps between responses. It matters only
+when `brotli_reuse_memory` is on.
+
+- `aggressive` keeps every buffer, so a worker allocates only what its largest
+  responses grow into. This is the fastest option, but each worker keeps memory
+  for its largest responses at `brotli_comp_level` 11 with a 16m `brotli_window`.
+- `current_config` keeps buffers only while they suit the current level and
+  window. They are released when the encoder is reused for a location with
+  different settings.
+- `bounded <size>` keeps buffers while they fit within `size`, and releases them
+  after a response that grew past it.
+- `release_all` keeps nothing between responses; only the encoder itself is reused.
+
+Idle encoders are reused only by locations with the same retention policy; when a
+worker's 4 idle slots are full, the least recently used encoder is freed.
+
+*Not in google/ngx_brotli.*
+
 ## Variables
 
 ### `$brotli_ratio`
@@ -140,12 +178,11 @@ is on.
 ## Differences from google/ngx_brotli
 
 - **`brotli_buffers` takes effect** (see above).
-- **Encoders are reused.** Each worker keeps up to 4 idle encoders, and each
-  keeps at most 8 MiB of working memory between responses. An encoder whose
-  working set grows past that (high levels with large windows) releases it after
-  every response, as it would without reuse. Peak memory still follows the
-  number of responses being compressed at once, times the working set that
-  `brotli_comp_level` and `brotli_window` need.
+- **Encoders are reused** by default (`brotli_reuse_memory`), each keeping at
+  most 8 MiB of working memory between responses (`brotli_retention_policy`).
+  Set `brotli_reuse_memory off` to allocate per response as google/ngx_brotli
+  does. Peak memory still follows the number of responses being compressed at
+  once, times the working set that `brotli_comp_level` and `brotli_window` need.
 - **The size hint comes from `Content-Length`.** When the length is known it is
   passed to the encoder, which uses it to choose a match finder at levels 4–9.
 - The pure-Rust mbrotli encoder replaces the C library. It produces the same
