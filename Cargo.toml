@@ -19,6 +19,10 @@ ngx = { version = "0.5.1", default-features = false, features = ["std"] }
 # Required by build.rs to receive DEP_NGINX_* metadata.
 nginx-sys = "0.5.0"
 
+[dev-dependencies]
+# Tests decode what the filter produces.
+mbrotli = { version = "0.5.6", default-features = false, features = ["std", "compression", "decompression"] }
+
 [build-dependencies]
 cc = "1.2"
 

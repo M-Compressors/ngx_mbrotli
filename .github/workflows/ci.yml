@@ -80,6 +80,68 @@ jobs:
           export TEST_NGINX_GLOBALS="load_module $PWD/target/release/libngx_mbrotli.so;"
           prove -v -I nginx-tests/lib t/
 
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # The module uses the sanitizer runtime linked into nginx, which must come
+      # from the same LLVM release as rustc.
+      - name: Install clang matching rustc's LLVM
+        run: |
+          llvm=$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')
+          curl -sSfL https://apt.llvm.org/llvm.sh -o "$RUNNER_TEMP/llvm.sh"
+          sudo bash "$RUNNER_TEMP/llvm.sh" "$llvm"
+          echo "CLANG=clang-$llvm" >> "$GITHUB_ENV"
+
+      # NGX_DEBUG_PALLOC gives every pool allocation its own malloc(), so that
+      # the sanitizer sees overflows of the buffers the module works with.
+      - uses: ./.github/actions/setup-nginx
+        with:
+          build: true
+          variant: asan-${{ env.CLANG }}
+          configure-args: >-
+            --with-cc=${{ env.CLANG }}
+            --with-cc-opt="-O1 -g -fsanitize=address -fno-omit-frame-pointer -DNGX_DEBUG_PALLOC=1"
+            --with-ld-opt=-fsanitize=address
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+
+      - name: Build module with AddressSanitizer
+        env:
+          CC: ${{ env.CLANG }}
+          CFLAGS: -fsanitize=address -fno-omit-frame-pointer
+          RUSTFLAGS: -Zsanitizer=address -Zexternal-clangrt -Cforce-frame-pointers=yes
+          CARGO_PROFILE_RELEASE_DEBUG: "true"
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          cargo build --release -Zbuild-std --target "$target"
+          cp "target/$target/release/libngx_mbrotli.so" "$RUNNER_TEMP/"
+
+      - name: Check out nginx-tests
+        uses: actions/checkout@v7
+        with:
+          repository: nginx/nginx-tests
+          path: nginx-tests
+
+      - name: Install the brotli CLI
+        run: sudo apt-get install -y -qq --no-install-recommends brotli
+
+      # Sanitizer reports go to the error log, which every test file checks
+      # ("no sanitizer errors"); leak checking is on by default.
+      - name: Integration tests under AddressSanitizer
+        env:
+          TEST_NGINX_BINARY: ${{ env.NGINX_BINARY }}
+          ASAN_OPTIONS: detect_stack_use_after_return=1:detect_odr_violation=0
+        run: |
+          export TEST_NGINX_GLOBALS="load_module $RUNNER_TEMP/libngx_mbrotli.so;"
+          prove -v -I nginx-tests/lib t/
+
   miri:
     name: miri
     runs-on: ubuntu-latest

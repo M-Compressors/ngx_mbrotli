@@ -8,6 +8,7 @@
 //! - `ngx_http_brotli_static_module` serves pre-compressed `.br` files.
 
 mod accept_encoding;
+mod body;
 mod encoder_pool;
 mod ratio;
 

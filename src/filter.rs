@@ -4,16 +4,13 @@
 //! the stock gzip filter, so `brotli_buffers` is honoured rather than ignored.
 
 use core::ffi::{c_char, c_void};
-use core::{ptr, slice};
+use core::{fmt, ptr};
 
-use mbrotli::{
-    EncodeError, EncoderConfig, EncoderSessionOwned, EncoderStatus, InputSize, Operation, Quality,
-    RetentionPolicy, StreamConfig, Window,
-};
+use mbrotli::{ConfigError, EncoderConfig, InputSize, Quality, RetentionPolicy, Window};
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, Pool};
 use ngx::ffi::{
-    NGX_AGAIN, NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12,
-    NGX_ERROR, NGX_HTTP_FORBIDDEN, NGX_HTTP_GZIP_BUFFERED, NGX_HTTP_LIF_CONF, NGX_HTTP_LOC_CONF,
+    NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12, NGX_ERROR,
+    NGX_HTTP_FORBIDDEN, NGX_HTTP_GZIP_BUFFERED, NGX_HTTP_LIF_CONF, NGX_HTTP_LOC_CONF,
     NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MODULE, NGX_HTTP_NOT_FOUND, NGX_HTTP_OK,
     NGX_HTTP_SRV_CONF, NGX_LOG_ALERT, NGX_LOG_EMERG, NGX_OK, ngx_alloc_chain_link, ngx_array_t,
     ngx_buf_t, ngx_bufs_t, ngx_chain_add_copy, ngx_chain_t, ngx_chain_update_chains, ngx_command_t,
@@ -23,19 +20,20 @@ use ngx::ffi::{
     ngx_http_html_default_types, ngx_http_merge_types, ngx_http_module_t,
     ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
     ngx_http_test_content_type, ngx_http_top_body_filter, ngx_http_top_header_filter,
-    ngx_http_types_slot, ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_module_t,
-    ngx_pagesize, ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t, ngx_str_t,
-    ngx_table_elt_t, ngx_uint_t, off_t,
+    ngx_http_types_slot, ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_log_t,
+    ngx_module_t, ngx_pagesize, ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t,
+    ngx_str_t, ngx_table_elt_t, ngx_uint_t, off_t,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug_mask, ngx_log_error, ngx_string};
 
 use crate::accept_encoding;
 use crate::bitfields::{
-    BufFlags, ngx_mbrotli_buf_set_flush, ngx_mbrotli_buf_set_last_buf,
+    buf_flags, ngx_mbrotli_buf_set_flush, ngx_mbrotli_buf_set_last_buf,
     ngx_mbrotli_buf_set_recycled, ngx_mbrotli_r_header_only, ngx_mbrotli_r_prepare_encoded,
     ngx_mbrotli_r_set_buffered, ngx_mbrotli_r_set_gzip_vary, ngx_mbrotli_var_set,
     ngx_mbrotli_var_set_not_found,
 };
+use crate::body::{self, BodyFilter, BufFlags, Host, Settings};
 use crate::encoder_pool;
 use crate::ratio;
 
@@ -192,6 +190,8 @@ unsafe fn loc_conf<'a>(r: *mut ngx_http_request_t) -> &'a FilterConf {
     unsafe { &*(*(*r).loc_conf.add(module().ctx_index)).cast::<FilterConf>() }
 }
 
+type FilterCtx = BodyFilter<NginxHost>;
+
 unsafe fn request_ctx(r: *mut ngx_http_request_t) -> *mut FilterCtx {
     unsafe { (*(*r).ctx.add(module().ctx_index)).cast() }
 }
@@ -238,7 +238,17 @@ unsafe extern "C" fn header_filter(r: *mut ngx_http_request_t) -> ngx_int_t {
         return unsafe { next_header_filter(r) };
     }
 
-    let ctx = unsafe { Pool::from_ngx_pool(req.pool) }.allocate(FilterCtx::new(r, content_length));
+    let settings = match settings(conf, content_length) {
+        Ok(settings) => settings,
+        Err(err) => {
+            let log = unsafe { (*req.connection).log };
+            ngx_log_error!(NGX_LOG_ALERT, log, "brotli encoder config failed: {err}");
+            return unsafe { next_header_filter(r) };
+        }
+    };
+
+    let ctx = BodyFilter::new(NginxHost { request: r }, settings);
+    let ctx = unsafe { Pool::from_ngx_pool(req.pool) }.allocate(ctx);
     if ctx.is_null() {
         return NGX_ERROR as ngx_int_t;
     }
@@ -264,7 +274,8 @@ unsafe extern "C" fn header_filter(r: *mut ngx_http_request_t) -> ngx_int_t {
 unsafe extern "C" fn body_filter(r: *mut ngx_http_request_t, input: *mut ngx_chain_t) -> ngx_int_t {
     let ctx = unsafe { request_ctx(r) };
 
-    if ctx.is_null() || unsafe { (*ctx).done } || unsafe { ngx_mbrotli_r_header_only(r) } != 0 {
+    if ctx.is_null() || unsafe { (*ctx).is_done() } || unsafe { ngx_mbrotli_r_header_only(r) } != 0
+    {
         return unsafe { next_body_filter(r, input) };
     }
 
@@ -274,106 +285,75 @@ unsafe extern "C" fn body_filter(r: *mut ngx_http_request_t, input: *mut ngx_cha
         "http brotli filter"
     );
 
-    let ctx = unsafe { &mut *ctx };
-    match unsafe { ctx.filter(input) } {
-        Ok(rc) => rc,
-        Err(Failed) => {
-            ctx.fail();
-            NGX_ERROR as ngx_int_t
-        }
-    }
+    unsafe { (*ctx).filter(input) }
 }
 
-/// An error that has already been logged; the response must be aborted.
-struct Failed;
-
-/// What the filter loop should do after a step.
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum Step {
-    /// The step completed; carry on with the next one.
-    Ok,
-    /// Repeat the inner loop.
-    Again,
-    /// Nothing more can be done in the inner loop.
-    Declined,
-}
-
-/// Per-request state, allocated from the request pool and dropped by its
-/// cleanup handler.
-struct FilterCtx {
+/// The NGINX side of [`Host`], for one request.
+struct NginxHost {
     request: *mut ngx_http_request_t,
-    session: Option<EncoderSessionOwned>,
-    /// Whether the encoder goes back to the per-worker cache when done.
-    reuse_memory: bool,
-    content_length: off_t,
-
-    /// Input not yet handed to the encoder.
-    input: *mut ngx_chain_t,
-    /// The input buffer being consumed; null once it has been drained.
-    ///
-    /// A drained buffer belongs to the filter that produced it again and may be
-    /// refilled with later data, so it must never be read after that point.
-    in_buf: *mut ngx_buf_t,
-
-    free: *mut ngx_chain_t,
-    busy: *mut ngx_chain_t,
-    out: *mut ngx_chain_t,
-    out_tail: *mut ngx_chain_t,
-    /// The output buffer being filled; null once it has been queued.
-    out_buf: *mut ngx_buf_t,
-    bufs: ngx_int_t,
-
-    operation: Operation,
-    /// The encoder holds output that did not fit the last buffer.
-    redo: bool,
-    nomem: bool,
-    done: bool,
-    success: bool,
-
-    bytes_in: u64,
-    bytes_out: u64,
 }
 
-impl Drop for FilterCtx {
-    fn drop(&mut self) {
-        self.release_encoder();
-    }
-}
-
-impl FilterCtx {
-    fn new(request: *mut ngx_http_request_t, content_length: off_t) -> Self {
-        Self {
-            request,
-            session: None,
-            reuse_memory: false,
-            content_length,
-            input: ptr::null_mut(),
-            in_buf: ptr::null_mut(),
-            free: ptr::null_mut(),
-            busy: ptr::null_mut(),
-            out: ptr::null_mut(),
-            out_tail: ptr::null_mut(),
-            out_buf: ptr::null_mut(),
-            bufs: 0,
-            operation: Operation::Process,
-            redo: false,
-            nomem: false,
-            done: false,
-            success: false,
-            bytes_in: 0,
-            bytes_out: 0,
-        }
-    }
-
+impl NginxHost {
     fn pool(&self) -> *mut ngx_pool_t {
         unsafe { (*self.request).pool }
     }
 
-    fn log(&self) -> *mut ngx::ffi::ngx_log_t {
+    fn log(&self) -> *mut ngx_log_t {
         unsafe { (*(*self.request).connection).log }
     }
+}
 
-    fn set_buffered(&self, on: bool) {
+impl Host for NginxHost {
+    unsafe fn chain_add_copy(
+        &mut self,
+        chain: &mut *mut ngx_chain_t,
+        input: *mut ngx_chain_t,
+    ) -> bool {
+        unsafe { ngx_chain_add_copy(self.pool(), chain, input) == NGX_OK as ngx_int_t }
+    }
+
+    unsafe fn update_chains(
+        &mut self,
+        free: &mut *mut ngx_chain_t,
+        busy: &mut *mut ngx_chain_t,
+        out: &mut *mut ngx_chain_t,
+    ) {
+        unsafe { ngx_chain_update_chains(self.pool(), free, busy, out, buf_tag()) };
+    }
+
+    fn alloc_chain_link(&mut self) -> *mut ngx_chain_t {
+        unsafe { ngx_alloc_chain_link(self.pool()) }
+    }
+
+    unsafe fn free_chain(&mut self, cl: *mut ngx_chain_t) {
+        // ngx_free_chain()
+        let pool = self.pool();
+        unsafe {
+            (*cl).next = (*pool).chain;
+            (*pool).chain = cl;
+        }
+    }
+
+    fn create_temp_buf(&mut self, size: usize) -> *mut ngx_buf_t {
+        let b = unsafe { ngx_create_temp_buf(self.pool(), size) };
+        if !b.is_null() {
+            unsafe {
+                (*b).tag = buf_tag();
+                ngx_mbrotli_buf_set_recycled(b);
+            }
+        }
+        b
+    }
+
+    fn calloc_buf(&mut self) -> *mut ngx_buf_t {
+        unsafe { ngx_pcalloc(self.pool(), size_of::<ngx_buf_t>()) }.cast()
+    }
+
+    unsafe fn next_body_filter(&mut self, chain: *mut ngx_chain_t) -> ngx_int_t {
+        unsafe { next_body_filter(self.request, chain) }
+    }
+
+    fn set_buffered(&mut self, on: bool) {
         unsafe {
             ngx_mbrotli_r_set_buffered(
                 self.request,
@@ -383,415 +363,47 @@ impl FilterCtx {
         };
     }
 
-    fn release_encoder(&mut self) {
-        if let Some(session) = self.session.take()
-            && self.reuse_memory
-        {
-            encoder_pool::release(session.into_compressor());
-        }
+    unsafe fn buf_flags(&self, b: *const ngx_buf_t) -> BufFlags {
+        unsafe { buf_flags(b.cast_mut()) }
     }
 
-    fn fail(&mut self) {
-        self.done = true;
-        self.release_encoder();
+    unsafe fn set_flush(&self, b: *mut ngx_buf_t) {
+        unsafe { ngx_mbrotli_buf_set_flush(b) };
     }
 
-    unsafe fn filter(&mut self, input: *mut ngx_chain_t) -> Result<ngx_int_t, Failed> {
-        let r = self.request;
-
-        if self.session.is_none() {
-            self.start()?;
-        }
-
-        if !input.is_null() {
-            if unsafe { ngx_chain_add_copy(self.pool(), &mut self.input, input) } != NGX_OK as _ {
-                return Err(Failed);
-            }
-            self.set_buffered(true);
-        }
-
-        let mut flush = if self.nomem {
-            // Push busy buffers downstream to get some of them back.
-            if unsafe { next_body_filter(r, ptr::null_mut()) } == NGX_ERROR as ngx_int_t {
-                return Err(Failed);
-            }
-            let mut cl = ptr::null_mut();
-            unsafe {
-                ngx_chain_update_chains(
-                    self.pool(),
-                    &mut self.free,
-                    &mut self.busy,
-                    &mut cl,
-                    buf_tag(),
-                )
-            };
-            self.nomem = false;
-            false
-        } else {
-            !self.busy.is_null()
-        };
-
-        loop {
-            // Cycle while there is input for the encoder and room for output.
-            loop {
-                match self.add_data()? {
-                    Step::Declined => break,
-                    Step::Again => continue,
-                    Step::Ok => {}
-                }
-
-                if !self.get_buf()? {
-                    break;
-                }
-
-                if self.compress()? == Step::Ok {
-                    break;
-                }
-            }
-
-            if self.out.is_null() && !flush {
-                return Ok(if self.busy.is_null() {
-                    NGX_OK as ngx_int_t
-                } else {
-                    NGX_AGAIN as ngx_int_t
-                });
-            }
-
-            let rc = unsafe { next_body_filter(r, self.out) };
-            if rc == NGX_ERROR as ngx_int_t {
-                return Err(Failed);
-            }
-
-            unsafe {
-                ngx_chain_update_chains(
-                    self.pool(),
-                    &mut self.free,
-                    &mut self.busy,
-                    &mut self.out,
-                    buf_tag(),
-                )
-            };
-            self.out_tail = ptr::null_mut();
-            self.nomem = false;
-            flush = false;
-
-            if self.done {
-                return Ok(rc);
-            }
-        }
+    unsafe fn set_last_buf(&self, b: *mut ngx_buf_t) {
+        unsafe { ngx_mbrotli_buf_set_last_buf(b) };
     }
 
-    fn start(&mut self) -> Result<(), Failed> {
-        let conf = unsafe { loc_conf(self.request) };
-
-        // Shrink the window for responses known to be smaller than it.
-        let window_bits = if self.content_length > 0 {
-            let mut bits = MIN_WINDOW_BITS;
-            while bits < conf.lg_win && self.content_length > (1 << bits) {
-                bits += 1;
-            }
-            bits
-        } else {
-            conf.lg_win
-        };
-
-        let reuse_memory = conf.reuse_memory != 0;
-        let retention = conf.retention.unwrap_or(encoder_pool::DEFAULT_RETENTION);
-
-        let compressor = Quality::try_from(conf.quality as u8)
-            .and_then(|quality| Ok((quality, Window::standard(window_bits as u8)?)))
-            .map(|(quality, window)| {
-                EncoderConfig::default()
-                    .with_quality(quality)
-                    .with_window(window)
-            })
-            .and_then(|config| {
-                if reuse_memory {
-                    encoder_pool::acquire(config, retention)
-                } else {
-                    encoder_pool::build(config, retention)
-                }
-            })
-            .map_err(|err| {
-                ngx_log_error!(
-                    NGX_LOG_ALERT,
-                    self.log(),
-                    "brotli encoder config failed: {err}"
-                );
-                Failed
-            })?;
-
-        let input_size = if self.content_length > 0 {
-            InputSize::Exact(self.content_length as u64)
-        } else {
-            InputSize::Unknown
-        };
-
-        let session = compressor
-            .into_session(StreamConfig::from(input_size))
-            .map_err(|err| self.encode_error(&err))?;
-        self.session = Some(session);
-        self.reuse_memory = reuse_memory;
-
-        ngx_log_debug_mask!(
-            DebugMask::Http,
-            self.log(),
-            "brotli encoder initialized: lvl:{} win:{} reuse:{} retention:{:?}",
-            conf.quality,
-            1usize << window_bits,
-            reuse_memory,
-            retention
-        );
-
-        Ok(())
+    fn error(&self, args: fmt::Arguments<'_>) {
+        ngx_log_error!(NGX_LOG_ALERT, self.log(), "{args}");
     }
 
-    fn encode_error(&self, err: &EncodeError) -> Failed {
-        ngx_log_error!(NGX_LOG_ALERT, self.log(), "brotli encoder failed: {err}");
-        Failed
-    }
-
-    /// Bytes of the current input buffer still waiting for the encoder.
-    fn pending_input<'a>(&self) -> &'a [u8] {
-        match unsafe { self.in_buf.as_ref() } {
-            Some(b) if b.last > b.pos && unsafe { BufFlags::of(self.in_buf) }.in_memory() => unsafe {
-                slice::from_raw_parts(b.pos, b.last.offset_from(b.pos) as usize)
-            },
-            _ => &[],
-        }
-    }
-
-    /// Takes the next input buffer, if the encoder needs one.
-    fn add_data(&mut self) -> Result<Step, Failed> {
-        if !self.pending_input().is_empty() || self.operation != Operation::Process || self.redo {
-            return Ok(Step::Ok);
-        }
-
-        let cl = self.input;
-        if cl.is_null() {
-            return Ok(Step::Declined);
-        }
-
-        unsafe {
-            self.in_buf = (*cl).buf;
-            self.input = (*cl).next;
-            free_chain(self.pool(), cl);
-        }
-
-        let b = unsafe { &*self.in_buf };
-        let flags = unsafe { BufFlags::of(self.in_buf) };
-
-        if !flags.in_memory() && flags.in_file() && b.file_last > b.file_pos {
-            ngx_log_error!(NGX_LOG_ALERT, self.log(), "brotli filter got a file buffer");
-            return Err(Failed);
-        }
-
-        let empty = self.pending_input().is_empty();
-        if empty {
-            self.in_buf = ptr::null_mut();
-        }
-
-        if flags.last_buf() {
-            self.operation = Operation::Finish;
-        } else if flags.flush() {
-            self.operation = Operation::Flush;
-        } else if empty {
-            return Ok(Step::Again);
-        }
-
-        Ok(Step::Ok)
-    }
-
-    /// Makes sure there is an output buffer with free space. Returns `false`
-    /// when all `brotli_buffers` are busy downstream.
-    fn get_buf(&mut self) -> Result<bool, Failed> {
-        if let Some(b) = unsafe { self.out_buf.as_ref() }
-            && b.last < b.end
-        {
-            return Ok(true);
-        }
-
-        if !self.free.is_null() {
-            let cl = self.free;
-            unsafe {
-                self.out_buf = (*cl).buf;
-                self.free = (*cl).next;
-                free_chain(self.pool(), cl);
-            }
-            return Ok(true);
-        }
-
-        let conf = unsafe { loc_conf(self.request) };
-        if self.bufs >= conf.bufs.num {
-            self.nomem = true;
-            return Ok(false);
-        }
-
-        let b = unsafe { ngx_create_temp_buf(self.pool(), conf.bufs.size) };
-        let Some(b) = (unsafe { b.as_mut() }) else {
-            return Err(Failed);
-        };
-        b.tag = buf_tag();
-        unsafe { ngx_mbrotli_buf_set_recycled(b) };
-        self.out_buf = b;
-        self.bufs += 1;
-
-        Ok(true)
-    }
-
-    /// Runs the encoder once over the current input and output buffers.
-    fn compress(&mut self) -> Result<Step, Failed> {
-        let input = self.pending_input();
-        let input_len = input.len();
-        let out_buf = unsafe { &mut *self.out_buf };
-        let room = unsafe { out_buf.end.offset_from(out_buf.last) } as usize;
-        let output = unsafe { slice::from_raw_parts_mut(out_buf.last, room) };
-
-        let session = self.session.as_mut().ok_or(Failed)?;
-        let progress = match session.process(input, output, self.operation) {
-            Ok(progress) => progress,
-            Err(err) => return Err(self.encode_error(&err)),
-        };
-
-        if progress.consumed > 0 {
-            unsafe { (*self.in_buf).pos = (*self.in_buf).pos.add(progress.consumed) };
-            if progress.consumed == input_len {
-                self.in_buf = ptr::null_mut();
-            }
-        }
-        out_buf.last = unsafe { out_buf.last.add(progress.produced) };
-        self.bytes_in += progress.consumed as u64;
-        self.bytes_out += progress.produced as u64;
-
-        ngx_log_debug_mask!(
-            DebugMask::Http,
-            self.log(),
-            "brotli in:{} consumed:{} out:{} produced:{} op:{:?} status:{:?}",
-            input_len,
-            progress.consumed,
-            room,
-            progress.produced,
-            self.operation,
-            progress.status
-        );
-
-        if out_buf.last == out_buf.end && progress.status != EncoderStatus::Finished {
-            self.queue_out_buf()?;
-        }
-
-        match progress.status {
-            EncoderStatus::NeedsOutput => {
-                if progress.produced == 0 {
-                    ngx_log_error!(NGX_LOG_ALERT, self.log(), "brotli encoder made no progress");
-                    return Err(Failed);
-                }
-                self.redo = true;
-                Ok(Step::Again)
-            }
-
-            EncoderStatus::Finished => {
-                self.redo = false;
-                let b = self.take_out_buf();
-                if b.is_null() {
-                    return Err(Failed);
-                }
-                unsafe { ngx_mbrotli_buf_set_last_buf(b) };
-                self.queue(b)?;
-
-                self.done = true;
-                self.success = true;
-                self.release_encoder();
-                self.set_buffered(false);
-                Ok(Step::Ok)
-            }
-
-            EncoderStatus::NeedsInput => {
-                self.redo = false;
-                match self.operation {
-                    Operation::Process => {
-                        if progress.consumed == 0 && input_len != 0 {
-                            ngx_log_error!(
-                                NGX_LOG_ALERT,
-                                self.log(),
-                                "brotli encoder made no progress"
-                            );
-                            return Err(Failed);
-                        }
-                        Ok(Step::Again)
-                    }
-
-                    Operation::Flush => {
-                        self.operation = Operation::Process;
-
-                        let b = match unsafe { self.out_buf.as_ref() } {
-                            Some(b) if b.last != b.pos => self.take_out_buf(),
-                            // Nothing to send: a special buffer carries the flush.
-                            _ => unsafe { ngx_pcalloc(self.pool(), size_of::<ngx_buf_t>()) }.cast(),
-                        };
-                        if b.is_null() {
-                            return Err(Failed);
-                        }
-                        unsafe { ngx_mbrotli_buf_set_flush(b) };
-                        self.queue(b)?;
-
-                        self.set_buffered(false);
-                        Ok(Step::Ok)
-                    }
-
-                    Operation::Finish => {
-                        ngx_log_error!(
-                            NGX_LOG_ALERT,
-                            self.log(),
-                            "brotli encoder did not finish the stream"
-                        );
-                        Err(Failed)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Detaches the current output buffer, allocating an empty one if needed.
-    fn take_out_buf(&mut self) -> *mut ngx_buf_t {
-        let b = core::mem::replace(&mut self.out_buf, ptr::null_mut());
-        if b.is_null() {
-            unsafe { ngx_pcalloc(self.pool(), size_of::<ngx_buf_t>()) }.cast()
-        } else {
-            b
-        }
-    }
-
-    fn queue_out_buf(&mut self) -> Result<(), Failed> {
-        let b = self.take_out_buf();
-        self.queue(b)
-    }
-
-    fn queue(&mut self, b: *mut ngx_buf_t) -> Result<(), Failed> {
-        let cl = unsafe { ngx_alloc_chain_link(self.pool()) };
-        if b.is_null() || cl.is_null() {
-            return Err(Failed);
-        }
-
-        unsafe {
-            (*cl).buf = b;
-            (*cl).next = ptr::null_mut();
-            match self.out_tail.as_mut() {
-                Some(tail) => tail.next = cl,
-                None => self.out = cl,
-            }
-        }
-        self.out_tail = cl;
-
-        Ok(())
+    fn debug(&self, args: fmt::Arguments<'_>) {
+        ngx_log_debug_mask!(DebugMask::Http, self.log(), "{args}");
     }
 }
 
-/// `ngx_free_chain()`: returns a chain link to the pool's free list.
-unsafe fn free_chain(pool: *mut ngx_pool_t, cl: *mut ngx_chain_t) {
-    unsafe {
-        (*cl).next = (*pool).chain;
-        (*pool).chain = cl;
-    }
+/// Resolves the location configuration for a response of `content_length`
+/// bytes (`-1` if unknown).
+fn settings(conf: &FilterConf, content_length: off_t) -> Result<Settings, ConfigError> {
+    let quality = Quality::try_from(conf.quality as u8)?;
+    let window = Window::standard(body::window_bits(content_length, conf.lg_win as u8))?;
+
+    Ok(Settings {
+        encoder: EncoderConfig::default()
+            .with_quality(quality)
+            .with_window(window),
+        input_size: if content_length > 0 {
+            InputSize::Exact(content_length as u64)
+        } else {
+            InputSize::Unknown
+        },
+        reuse_memory: conf.reuse_memory != 0,
+        retention: conf.retention.unwrap_or(encoder_pool::DEFAULT_RETENTION),
+        bufs_num: conf.bufs.num as usize,
+        bufs_size: conf.bufs.size,
+    })
 }
 
 unsafe extern "C" fn create_conf(cf: *mut ngx_conf_t) -> *mut c_void {
@@ -970,13 +582,13 @@ unsafe extern "C" fn ratio_variable(
     v: *mut ngx_http_variable_value_t,
     _data: usize,
 ) -> ngx_int_t {
-    let ctx = unsafe { request_ctx(r).as_ref() };
-    let Some(ctx) = ctx.filter(|ctx| ctx.success && ctx.bytes_out != 0) else {
+    let sizes = unsafe { request_ctx(r).as_ref() }.and_then(FilterCtx::sizes);
+    let Some((bytes_in, bytes_out)) = sizes.filter(|&(_, out)| out != 0) else {
         unsafe { ngx_mbrotli_var_set_not_found(v) };
         return NGX_OK as ngx_int_t;
     };
 
-    let ratio = ratio::format(ctx.bytes_in, ctx.bytes_out);
+    let ratio = ratio::format(bytes_in, bytes_out);
     let data: *mut u8 = unsafe { ngx_pnalloc((*r).pool, ratio.len()) }.cast();
     if data.is_null() {
         return NGX_ERROR as ngx_int_t;

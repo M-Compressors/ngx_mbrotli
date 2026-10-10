@@ -145,7 +145,9 @@ unsafe fn send_file(r: *mut ngx_http_request_t) -> Result<ngx_int_t, ngx_int_t> 
         return Err(SERVER_ERROR);
     }
     unsafe { ptr::copy_nonoverlapping(SUFFIX.as_ptr(), last, SUFFIX.len()) };
-    path.len += SUFFIX.len() - 1;
+    // `path.len` is the size of the allocation, not of the string in it; the
+    // name ends right before the terminating NUL written above.
+    path.len = unsafe { last.add(SUFFIX.len() - 1).offset_from(path.data) } as usize;
 
     ngx_log_debug_mask!(DebugMask::Http, log, "http filename: \"{path}\"");
 

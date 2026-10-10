@@ -4,6 +4,8 @@
 //! bindgen generates for them can disagree with the C compiler's layout, so
 //! every flag this crate reads or writes goes through these functions.
 
+use crate::body::BufFlags;
+
 use ngx::ffi::{
     ngx_buf_t, ngx_file_t, ngx_http_core_loc_conf_t, ngx_http_request_t, ngx_http_variable_value_t,
     ngx_open_file_info_t, ngx_uint_t, off_t,
@@ -36,32 +38,18 @@ unsafe extern "C" {
     fn ngx_mbrotli_of_flags(of: *mut ngx_open_file_info_t) -> ngx_uint_t;
 }
 
-/// Flags of an `ngx_buf_t`.
-#[derive(Copy, Clone)]
-pub struct BufFlags(ngx_uint_t);
-
-impl BufFlags {
-    /// # Safety
-    ///
-    /// `b` must point to a valid buffer.
-    pub unsafe fn of(b: *mut ngx_buf_t) -> Self {
-        Self(unsafe { ngx_mbrotli_buf_flags(b) })
-    }
-
-    pub fn in_memory(self) -> bool {
-        self.0 & 0x01 != 0
-    }
-
-    pub fn in_file(self) -> bool {
-        self.0 & 0x02 != 0
-    }
-
-    pub fn last_buf(self) -> bool {
-        self.0 & 0x04 != 0
-    }
-
-    pub fn flush(self) -> bool {
-        self.0 & 0x08 != 0
+/// The flags of an `ngx_buf_t`.
+///
+/// # Safety
+///
+/// `b` must point to a valid buffer.
+pub unsafe fn buf_flags(b: *mut ngx_buf_t) -> BufFlags {
+    let flags = unsafe { ngx_mbrotli_buf_flags(b) };
+    BufFlags {
+        in_memory: flags & 0x01 != 0,
+        in_file: flags & 0x02 != 0,
+        last_buf: flags & 0x04 != 0,
+        flush: flags & 0x08 != 0,
     }
 }
 

@@ -11,6 +11,12 @@ inputs:
   build:
     description: Also run `make`, producing an nginx binary.
     default: "false"
+  configure-args:
+    description: Extra `./configure` arguments, as shell words.
+    default: ""
+  variant:
+    description: Names the build in the cache key when `configure-args` is set.
+    default: default
 
 runs:
   using: composite
@@ -27,7 +33,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: ${{ runner.temp }}/nginx-${{ inputs.version }}
-        key: nginx-${{ inputs.version }}-build-${{ inputs.build }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-nginx/action.yml') }}
+        key: nginx-${{ inputs.version }}-${{ inputs.variant }}-build-${{ inputs.build }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-nginx/action.yml') }}
 
     - name: Download and configure NGINX
       if: steps.cache.outputs.cache-hit != 'true'
@@ -36,11 +42,12 @@ runs:
       env:
         VERSION: ${{ inputs.version }}
         BUILD: ${{ inputs.build }}
+        CONFIGURE_ARGS: ${{ inputs.configure-args }}
       run: |
         set -euo pipefail
         curl -sSfL "https://nginx.org/download/nginx-$VERSION.tar.gz" | tar xz
         cd "nginx-$VERSION"
-        ./configure --with-compat --with-debug --with-http_ssl_module
+        eval "./configure --with-compat --with-debug --with-http_ssl_module $CONFIGURE_ARGS"
         if [ "$BUILD" = true ]; then
           make -j"$(nproc)"
         fi

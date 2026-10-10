@@ -223,8 +223,17 @@ TEST_NGINX_GLOBALS="load_module $PWD/target/release/libngx_mbrotli.so;" \
 ## Contributing and releases
 
 CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`:
-rustfmt, clippy, Miri over the unit tests, and the unit and integration tests
-against NGINX 1.28, 1.30 and 1.31.
+
+- rustfmt and clippy;
+- unit and integration tests against NGINX 1.28, 1.30 and 1.31;
+- the integration tests under AddressSanitizer and LeakSanitizer, with NGINX
+  and the module (including the Rust standard library) instrumented, and
+  `NGX_DEBUG_PALLOC` so that each pool allocation is checked on its own;
+- the unit tests under Miri. The body filter (`src/body.rs`) reaches NGINX only
+  through a small `Host` trait, so Miri runs it against a model of NGINX's
+  buffer and chain API (`src/body/tests.rs`). The model frees drained input
+  buffers and chain links, and leaves output buffers uninitialized, so stale
+  pointers and reads of unwritten output show up as undefined behaviour.
 
 Changelogs and versions are managed with [Sampo](https://github.com/bruits/sampo).
 Every user-facing change needs a changeset, a short Markdown file in

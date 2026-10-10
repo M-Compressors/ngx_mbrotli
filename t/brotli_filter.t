@@ -19,7 +19,7 @@ use Test::Nginx qw/ :DEFAULT http_content /;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http proxy ssi gzip/)->has_daemon('brotli')->plan(45)
+my $t = Test::Nginx->new()->has(qw/http proxy ssi gzip/)->has_daemon('brotli')->plan(46)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -111,6 +111,13 @@ http {
 
         location /proxy/ {
             proxy_pass http://127.0.0.1:8081/;
+        }
+
+        # Every buffer read from the upstream carries the flush flag.
+        location /unbuffered/ {
+            proxy_pass http://127.0.0.1:8081/;
+            proxy_buffering off;
+            proxy_buffer_size 1k;
         }
 
         location /cond/ {
@@ -247,6 +254,9 @@ for my $prefix (qw/noreuse aggressive current_config release_all bounded/) {
 
 $r = get('/proxy/index.html', 'br');
 is(br_body($r), $html, 'proxied response');
+
+$r = get('/unbuffered/index.html', 'br');
+is(br_body($r), $html, 'unbuffered proxied response');
 
 $r = get('/404', 'br');
 like($r, qr/^Content-Encoding: br/mi, '404 compressed');
