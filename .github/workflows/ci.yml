@@ -133,11 +133,13 @@ jobs:
         run: sudo apt-get install -y -qq --no-install-recommends brotli
 
       # Sanitizer reports go to the error log, which every test file checks
-      # ("no sanitizer errors"); leak checking is on by default.
+      # ("no sanitizer errors"); leak checking is on by default, except for
+      # what nginx itself leaks on worker exit (see .github/lsan.supp).
       - name: Integration tests under AddressSanitizer
         env:
           TEST_NGINX_BINARY: ${{ env.NGINX_BINARY }}
           ASAN_OPTIONS: detect_stack_use_after_return=1:detect_odr_violation=0
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan.supp
           TEST_NGINX_LEAVE: 1
         run: |
           export TEST_NGINX_GLOBALS="load_module $RUNNER_TEMP/libngx_mbrotli.so;"
