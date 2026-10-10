@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
+authors = ["Mikhail Panfilov <mikhail@panfilov.tech>"]
 description = "NGINX Brotli compression modules (drop-in for google/ngx_brotli) built on ngx-rust and mbrotli"
-publish = false
+publish = true
+categories = ["network-programming", "compression", "algorithms", "development-tools"]
+keywords = ["mbrotli", "brotli", "nginx", "nginx-compression"]
 
 [lib]
 crate-type = ["cdylib"]
