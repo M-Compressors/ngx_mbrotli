@@ -189,6 +189,141 @@ is on.
   bytes as Google's encoder at every level, so you do not need to vendor or build
   the C Brotli library.
 
+## Benchmarks
+
+One NGINX worker compressing static files on the fly with ngx_mbrotli and with
+google/ngx_brotli, as each is shipped: google/ngx_brotli at commit
+[`a71f9312`](https://github.com/google/ngx_brotli/commit/a71f9312c2deb28875acc7bacfdd5695a111aa53)
+with the Brotli 1.1.0 it pins as a submodule. Both run with default settings apart
+from `brotli_comp_level`, so ngx_mbrotli reuses encoders
+(`brotli_reuse_memory on`).
+
+- **Level 11 is 38–63% faster** at every response size.
+- **Level 9 is 2.6–4.3 times faster** on 85–230 KB responses and 21% faster at
+  1 MB, but 8% slower on 2 KB responses.
+- **Level 6, the default, is 2–7% faster** on 85 KB–1 MB responses, but 12%
+  slower on 2 KB responses.
+- **Level 4 is 1–5% slower**, except at 1 MB, where it is 6% faster.
+- **Level 1 is 17–41% faster** on responses over 32 KB, and its output is smaller.
+- **Output matches byte for byte** at levels 2–11. The exceptions are levels 0–1,
+  where ngx_mbrotli's output is 3–15% smaller on responses over 32 KB, and
+  responses of 1 MB or more at levels 4–9, where the size hint selects a
+  different match finder.
+- **A worker uses 2–5 MiB more memory**, except at level 9, where its peak is
+  under a third of google/ngx_brotli's.
+
+### Requests per second and compressed size
+
+Requests per second are the median of three runs; the difference is ngx_mbrotli
+relative to google/ngx_brotli. Sizes are response bodies in bytes.
+
+| Response | Level | ngx_brotli, req/s | ngx_mbrotli, req/s | Difference | ngx_brotli, bytes | ngx_mbrotli, bytes |
+|---|--:|--:|--:|--:|--:|--:|
+| JSON, 1.9 KB | 1 | 51,825 | 52,403 | +1% | 717 | 717 |
+| JSON, 1.9 KB | 4 | 29,265 | 28,510 | -3% | 647 | 647 |
+| JSON, 1.9 KB | 6 | 27,783 | 24,351 | -12% | 575 | 575 |
+| JSON, 1.9 KB | 9 | 23,773 | 21,905 | -8% | 576 | 576 |
+| JSON, 1.9 KB | 11 | 624 | 861 | +38% | 504 | 504 |
+| jquery.min.js, 85 KB | 1 | 3,042 | 3,574 | +17% | 37,331 | 35,042 |
+| jquery.min.js, 85 KB | 4 | 1,142 | 1,126 | -1% | 31,402 | 31,402 |
+| jquery.min.js, 85 KB | 6 | 670 | 716 | +7% | 29,596 | 29,596 |
+| jquery.min.js, 85 KB | 9 | 111 | 466 | +322% | 29,478 | 29,478 |
+| jquery.min.js, 85 KB | 11 | 15.0 | 24.4 | +63% | 27,446 | 27,446 |
+| JSON, 94 KB | 1 | 3,603 | 4,362 | +21% | 28,756 | 26,228 |
+| JSON, 94 KB | 4 | 1,425 | 1,375 | -3% | 23,473 | 23,473 |
+| JSON, 94 KB | 6 | 850 | 865 | +2% | 21,813 | 21,813 |
+| JSON, 94 KB | 9 | 127 | 547 | +331% | 21,528 | 21,528 |
+| JSON, 94 KB | 11 | 14.7 | 22.4 | +52% | 19,346 | 19,346 |
+| HTML, 166 KB | 1 | 2,253 | 2,958 | +31% | 42,564 | 36,817 |
+| HTML, 166 KB | 4 | 974 | 943 | -3% | 31,435 | 31,435 |
+| HTML, 166 KB | 6 | 568 | 581 | +2% | 28,786 | 28,786 |
+| HTML, 166 KB | 9 | 105 | 330 | +215% | 28,370 | 28,370 |
+| HTML, 166 KB | 11 | 7.5 | 11.6 | +55% | 25,456 | 25,456 |
+| bootstrap.min.css, 227 KB | 1 | 1,931 | 2,729 | +41% | 45,205 | 39,929 |
+| bootstrap.min.css, 227 KB | 4 | 856 | 816 | -5% | 33,206 | 33,206 |
+| bootstrap.min.css, 227 KB | 6 | 509 | 523 | +3% | 27,432 | 27,432 |
+| bootstrap.min.css, 227 KB | 9 | 113 | 289 | +155% | 26,561 | 26,561 |
+| bootstrap.min.css, 227 KB | 11 | 5.5 | 8.1 | +47% | 22,709 | 22,709 |
+| react-dom.development.js, 1.03 MB | 1 | 309 | 404 | +31% | 318,221 | 270,279 |
+| react-dom.development.js, 1.03 MB | 4 | 145 | 153 | +6% | 234,457 | 227,902 |
+| react-dom.development.js, 1.03 MB | 6 | 69.8 | 73.9 | +6% | 210,434 | 207,478 |
+| react-dom.development.js, 1.03 MB | 9 | 25.5 | 30.8 | +21% | 201,502 | 201,701 |
+| react-dom.development.js, 1.03 MB | 11 | 1.0 | 1.6 | +60% | 183,001 | 183,001 |
+
+At level 9 the C encoder allocates a 32 MiB hash table (2^15 buckets of 256
+entries) for every response over 64 KB and frees it afterwards. That cost does
+not depend on the response size, so the difference shrinks as responses grow.
+
+At levels 0–1 the C encoder compresses each call's input on its own, and
+google/ngx_brotli calls it once per buffer that NGINX reads, 32 KB by default
+(`output_buffers`). That is why ngx_mbrotli's output is smaller there.
+
+### Worker memory
+
+Peak is the worker's highest resident set size during a 6-second load; idle is
+its resident set size one second after the load ends. Both are the median of
+three runs and include NGINX itself, about 1.8 MiB before the first request.
+
+| Response | Level | Connections | ngx_brotli, peak | ngx_mbrotli, peak | ngx_brotli, idle | ngx_mbrotli, idle |
+|---|--:|--:|--:|--:|--:|--:|
+| JSON, 1.9 KB | 6 | 64 | 3.3 MiB | 5.4 MiB | 3.3 MiB | 5.4 MiB |
+| jquery.min.js, 85 KB | 6 | 32 | 5.7 MiB | 8.0 MiB | 5.7 MiB | 8.0 MiB |
+| jquery.min.js, 85 KB | 9 | 32 | 33.9 MiB | 9.9 MiB | 3.7 MiB | 9.9 MiB |
+| react-dom.development.js, 1.03 MB | 6 | 32 | 9.2 MiB | 13.6 MiB | 3.4 MiB | 7.7 MiB |
+| react-dom.development.js, 1.03 MB | 11 | 8 | 23.0 MiB | 27.8 MiB | 17.2 MiB | 22.2 MiB |
+
+Idle memory includes encoders that ngx_mbrotli keeps for reuse (up to 4 per
+worker, see `brotli_retention_policy`) and memory that glibc has not returned to
+the system. After level 11 it varied between runs, from 17 to 21 MiB for
+google/ngx_brotli and from 19 to 23 MiB for ngx_mbrotli.
+
+<details>
+<summary>Hardware, build and method</summary>
+
+**Hardware**
+
+- Intel Core i7-13700KF, 47 GiB RAM.
+- Ubuntu 22.04.5 under WSL2, kernel 6.18.33.2-microsoft-standard-WSL2. WSL2
+  does not expose which cores are performance cores, so each round runs every
+  module back to back to spread host noise evenly.
+
+**Build**
+
+- NGINX 1.30.5, `./configure --with-compat --with-cc-opt=-O2
+  --without-http_rewrite_module --without-pcre`, gcc 11.4.0.
+- google/ngx_brotli at commit `a71f9312c2deb28875acc7bacfdd5695a111aa53`
+  (2023-10-09), as a dynamic module, with its `deps/brotli` submodule at
+  `ed738e842d2fbdf2d6459e39267a633c4a9b2f5d` (Brotli 1.1.0).
+- Brotli built as static libraries with CMake's Release flags,
+  `-O3 -DNDEBUG -fPIC`. google/ngx_brotli's README suggests `-march=native`,
+  which was not used; ngx_mbrotli is not built with `target-cpu=native` either.
+- ngx_mbrotli 0.2.0 with mbrotli 0.5.7, `cargo build --release` (rustc 1.98.1).
+
+**Configuration**
+
+`worker_processes 1` pinned to one CPU, `access_log off`, `open_file_cache`,
+`brotli on`, and one `location` per `brotli_comp_level` serving the same files.
+Everything else is left at its default, including `brotli_window 512k`.
+
+**Load**
+
+- wrk 4.1.0 on 4 other CPUs over loopback, without TLS, sending
+  `Accept-Encoding: br`.
+- Levels 1–9: 2 threads and 8 connections, for 4 seconds (8 seconds for the 1 MB
+  file). Levels 10–11: 2 connections for 15 seconds.
+- Each run follows a 1-second warm-up, and starts only once every worker has been
+  idle for 300 ms.
+- Every response was decoded with the Brotli 1.2.0 CLI and compared with the
+  original file.
+
+**Files**
+
+jQuery 3.7.1 (`jquery.min.js`), Bootstrap 5.3.3 (`bootstrap.min.css`) and React
+DOM 18.3.1 (`react-dom.development.js`) from cdnjs, the English Wikipedia page
+"HTTP compression", a cdnjs API listing (94 KB), and its first entries (1.9 KB).
+
+</details>
+
 ## Implementation notes
 
 The filter sits in the same place in the filter chain as google/ngx_brotli's, just
