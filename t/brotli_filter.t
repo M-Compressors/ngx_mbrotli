@@ -19,7 +19,7 @@ use Test::Nginx qw/ :DEFAULT http_content /;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http proxy ssi gzip/)->has_daemon('brotli')->plan(46)
+my $t = Test::Nginx->new()->has(qw/http proxy ssi gzip/)->has_daemon('brotli')->plan(51)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -36,6 +36,8 @@ http {
         text/html               html;
         text/css                css;
         application/javascript  js;
+        font/ttf                ttf;
+        application/octet-stream bin;
     }
 
     log_format ratio '$uri $brotli_ratio';
@@ -52,7 +54,8 @@ http {
         server_name  localhost;
 
         brotli on;
-        brotli_types text/plain application/javascript;
+        brotli_types text/plain application/javascript font/ttf
+                     application/octet-stream;
 
         access_log %%TESTDIR%%/ratio.log ratio;
 
@@ -154,6 +157,12 @@ http {
         location / {
             root %%TESTDIR%%;
         }
+
+        location /charset/ {
+            alias %%TESTDIR%%/;
+            charset utf-8;
+            charset_types font/ttf;
+        }
     }
 }
 
@@ -167,6 +176,12 @@ $t->write_file('app.js', $js);
 $t->write_file('style.css', 'body { color: red; }' x 100);
 $t->write_file('tiny.html', '<p>');
 $t->write_file('mid.html', 'X' x 500);
+
+# The same binary data, served as a font and as something else.
+my $font = join('', map { pack('nnN', $_ % 97, $_ * 7 % 13, $_ * 40503 % 4096) }
+	1 .. 20000);
+$t->write_file('font.ttf', $font);
+$t->write_file('font.bin', $font);
 mkdir($t->testdir() . '/ssi');
 $t->write_file('ssi/page.html',
 	'<html><!--# include virtual="/app.js" -->|'
@@ -222,6 +237,24 @@ unlike($r, qr/^Content-Encoding/mi, 'brotli_min_length');
 
 $r = get('/mid.html', 'br');
 like($r, qr/^Content-Encoding: br/mi, 'above min length');
+
+# encoder mode: font mode writes different distance parameters into every
+# meta-block header, so the same data compresses to different bytes
+
+$r = get('/font.ttf', 'br');
+is(br_body($r), $font, 'font roundtrip');
+my $font_br = http_content($r);
+
+$r = get('/font.bin', 'br');
+is(br_body($r), $font, 'binary roundtrip');
+isnt(http_content($r), $font_br, 'font mode');
+
+$r = get('/proxy/font.ttf', 'br');
+my $proxied_br = http_content($r);
+
+$r = get('/proxy/charset/font.ttf', 'br');
+like($r, qr!^Content-Type: font/ttf; charset=utf-8!mi, 'font with charset');
+is(http_content($r), $proxied_br, 'font mode ignores parameters');
 
 # configuration
 

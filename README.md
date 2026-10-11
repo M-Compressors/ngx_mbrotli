@@ -185,6 +185,13 @@ is on.
   once, times the working set that `brotli_comp_level` and `brotli_window` need.
 - **The size hint comes from `Content-Length`.** When the length is known it is
   passed to the encoder, which uses it to choose a match finder at levels 4–9.
+- **Fonts are compressed in Brotli's font mode.** Responses whose type is an
+  uncompressed TrueType or OpenType font (`font/ttf`, `font/otf`, `font/sfnt`,
+  `font/collection`, `application/vnd.ms-fontobject`, `application/x-font-ttf`
+  and similar) use font mode, which makes them about 0.1–0.3% smaller at levels
+  4–11 and does not affect speed. All other responses, including WOFF and WOFF2
+  fonts, which are already compressed, use generic mode as google/ngx_brotli
+  does. Text mode is not used: it does not change Brotli's output.
 - The pure-Rust mbrotli encoder replaces the C library. It produces the same
   bytes as Google's encoder at every level, so you do not need to vendor or build
   the C Brotli library.

@@ -6,7 +6,9 @@
 use core::ffi::{c_char, c_void};
 use core::{fmt, ptr};
 
-use mbrotli::{ConfigError, EncoderConfig, InputSize, Quality, RetentionPolicy, Window};
+use mbrotli::{
+    CompressionMode, ConfigError, EncoderConfig, InputSize, Quality, RetentionPolicy, Window,
+};
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, Pool};
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12, NGX_ERROR,
@@ -34,6 +36,7 @@ use crate::bitfields::{
     ngx_mbrotli_var_set_not_found,
 };
 use crate::body::{self, BodyFilter, BufFlags, Host, Settings};
+use crate::content_type;
 use crate::encoder_pool;
 use crate::ratio;
 
@@ -238,7 +241,8 @@ unsafe extern "C" fn header_filter(r: *mut ngx_http_request_t) -> ngx_int_t {
         return unsafe { next_header_filter(r) };
     }
 
-    let settings = match settings(conf, content_length) {
+    let mode = content_type::compression_mode(unsafe { response_content_type(req) });
+    let settings = match settings(conf, content_length, mode) {
         Ok(settings) => settings,
         Err(err) => {
             let log = unsafe { (*req.connection).log };
@@ -384,16 +388,31 @@ impl Host for NginxHost {
     }
 }
 
+/// The response's media type, without parameters when NGINX has parsed them.
+unsafe fn response_content_type(req: &ngx_http_request_t) -> &[u8] {
+    let content_type = &req.headers_out.content_type;
+    let len = req.headers_out.content_type_len.min(content_type.len);
+    if len == 0 {
+        return &[];
+    }
+    unsafe { core::slice::from_raw_parts(content_type.data, len) }
+}
+
 /// Resolves the location configuration for a response of `content_length`
-/// bytes (`-1` if unknown).
-fn settings(conf: &FilterConf, content_length: off_t) -> Result<Settings, ConfigError> {
+/// bytes (`-1` if unknown) compressed in `mode`.
+fn settings(
+    conf: &FilterConf,
+    content_length: off_t,
+    mode: CompressionMode,
+) -> Result<Settings, ConfigError> {
     let quality = Quality::try_from(conf.quality as u8)?;
     let window = Window::standard(body::window_bits(content_length, conf.lg_win as u8))?;
 
     Ok(Settings {
         encoder: EncoderConfig::default()
             .with_quality(quality)
-            .with_window(window),
+            .with_window(window)
+            .with_mode(mode),
         input_size: if content_length > 0 {
             InputSize::Exact(content_length as u64)
         } else {

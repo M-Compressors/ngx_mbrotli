@@ -9,6 +9,7 @@
 
 mod accept_encoding;
 mod body;
+mod content_type;
 mod encoder_pool;
 mod ratio;
 
