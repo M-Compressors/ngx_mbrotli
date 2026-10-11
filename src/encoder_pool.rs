@@ -13,11 +13,11 @@ use mbrotli::{Compressor, ConfigError, EncoderConfig, RetentionPolicy};
 /// How many idle compressors a worker keeps.
 const MAX_IDLE: usize = 4;
 
-/// The default retention policy: keep up to 8 MiB per idle compressor.
+/// The default retention policy: idle compressors keep every buffer.
 ///
-/// Encoders whose working set grows past this (high qualities with large
-/// windows) release it after every stream, as they would without the cache.
-pub const DEFAULT_RETENTION: RetentionPolicy = RetentionPolicy::Bounded { max_bytes: 8 << 20 };
+/// A worker holds on to what its largest responses grew into, so none of it
+/// is allocated again for later responses.
+pub const DEFAULT_RETENTION: RetentionPolicy = RetentionPolicy::Aggressive;
 
 thread_local! {
     /// Idle compressors, least recently released first.

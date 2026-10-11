@@ -126,7 +126,7 @@ freed when the response is complete, as with google/ngx_brotli.
 ### `brotli_retention_policy`
 
 - **syntax**: `brotli_retention_policy aggressive | current_config | release_all | bounded <size>`
-- **default**: `bounded 8m`
+- **default**: `aggressive`
 - **context**: `http`, `server`, `location`
 
 Sets how much working memory an encoder keeps between responses. It matters only
@@ -178,8 +178,8 @@ is on.
 ## Differences from google/ngx_brotli
 
 - **`brotli_buffers` takes effect** (see above).
-- **Encoders are reused** by default (`brotli_reuse_memory`), each keeping at
-  most 8 MiB of working memory between responses (`brotli_retention_policy`).
+- **Encoders are reused** by default (`brotli_reuse_memory`), each keeping all
+  of its working memory between responses (`brotli_retention_policy`).
   Set `brotli_reuse_memory off` to allocate per response as google/ngx_brotli
   does. Peak memory still follows the number of responses being compressed at
   once, times the working set that `brotli_comp_level` and `brotli_window` need.
