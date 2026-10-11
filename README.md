@@ -205,19 +205,20 @@ with the Brotli 1.1.0 it pins as a submodule. Both run with default settings apa
 from `brotli_comp_level`, so ngx_mbrotli reuses encoders
 (`brotli_reuse_memory on`).
 
-- **Level 11 is 38–63% faster** at every response size.
-- **Level 9 is 2.6–4.3 times faster** on 85–230 KB responses and 21% faster at
-  1 MB, but 8% slower on 2 KB responses.
-- **Level 6, the default, is 2–7% faster** on 85 KB–1 MB responses, but 12%
+- **Level 11 is 39–61% faster** at every response size.
+- **Level 9 is 2.8–4.3 times faster** on 85–230 KB responses and 62% faster at
+  1 MB, but 3% slower on 2 KB responses.
+- **Level 6, the default, is up to 8% faster** on 85 KB–1 MB responses, but 8%
   slower on 2 KB responses.
-- **Level 4 is 1–5% slower**, except at 1 MB, where it is 6% faster.
-- **Level 1 is 17–41% faster** on responses over 32 KB, and its output is smaller.
+- **Level 4 is up to 3% slower**, except at 1 MB, where it is 8% faster.
+- **Level 1 is 22–46% faster** on responses over 32 KB, and its output is smaller.
 - **Output matches byte for byte** at levels 2–11. The exceptions are levels 0–1,
   where ngx_mbrotli's output is 3–15% smaller on responses over 32 KB, and
   responses of 1 MB or more at levels 4–9, where the size hint selects a
   different match finder.
-- **A worker uses 2–5 MiB more memory**, except at level 9, where its peak is
-  under a third of google/ngx_brotli's.
+- **A worker's peak memory is 1.5–4 MiB higher**, except at level 9, where it is
+  under a third of google/ngx_brotli's. With the default
+  `brotli_retention_policy aggressive`, the worker keeps that memory when idle.
 
 ### Requests per second and compressed size
 
@@ -226,35 +227,35 @@ relative to google/ngx_brotli. Sizes are response bodies in bytes.
 
 | Response | Level | ngx_brotli, req/s | ngx_mbrotli, req/s | Difference | ngx_brotli, bytes | ngx_mbrotli, bytes |
 |---|--:|--:|--:|--:|--:|--:|
-| JSON, 1.9 KB | 1 | 51,825 | 52,403 | +1% | 717 | 717 |
-| JSON, 1.9 KB | 4 | 29,265 | 28,510 | -3% | 647 | 647 |
-| JSON, 1.9 KB | 6 | 27,783 | 24,351 | -12% | 575 | 575 |
-| JSON, 1.9 KB | 9 | 23,773 | 21,905 | -8% | 576 | 576 |
-| JSON, 1.9 KB | 11 | 624 | 861 | +38% | 504 | 504 |
-| jquery.min.js, 85 KB | 1 | 3,042 | 3,574 | +17% | 37,331 | 35,042 |
-| jquery.min.js, 85 KB | 4 | 1,142 | 1,126 | -1% | 31,402 | 31,402 |
-| jquery.min.js, 85 KB | 6 | 670 | 716 | +7% | 29,596 | 29,596 |
-| jquery.min.js, 85 KB | 9 | 111 | 466 | +322% | 29,478 | 29,478 |
-| jquery.min.js, 85 KB | 11 | 15.0 | 24.4 | +63% | 27,446 | 27,446 |
-| JSON, 94 KB | 1 | 3,603 | 4,362 | +21% | 28,756 | 26,228 |
-| JSON, 94 KB | 4 | 1,425 | 1,375 | -3% | 23,473 | 23,473 |
-| JSON, 94 KB | 6 | 850 | 865 | +2% | 21,813 | 21,813 |
-| JSON, 94 KB | 9 | 127 | 547 | +331% | 21,528 | 21,528 |
-| JSON, 94 KB | 11 | 14.7 | 22.4 | +52% | 19,346 | 19,346 |
-| HTML, 166 KB | 1 | 2,253 | 2,958 | +31% | 42,564 | 36,817 |
-| HTML, 166 KB | 4 | 974 | 943 | -3% | 31,435 | 31,435 |
-| HTML, 166 KB | 6 | 568 | 581 | +2% | 28,786 | 28,786 |
-| HTML, 166 KB | 9 | 105 | 330 | +215% | 28,370 | 28,370 |
-| HTML, 166 KB | 11 | 7.5 | 11.6 | +55% | 25,456 | 25,456 |
-| bootstrap.min.css, 227 KB | 1 | 1,931 | 2,729 | +41% | 45,205 | 39,929 |
-| bootstrap.min.css, 227 KB | 4 | 856 | 816 | -5% | 33,206 | 33,206 |
-| bootstrap.min.css, 227 KB | 6 | 509 | 523 | +3% | 27,432 | 27,432 |
-| bootstrap.min.css, 227 KB | 9 | 113 | 289 | +155% | 26,561 | 26,561 |
-| bootstrap.min.css, 227 KB | 11 | 5.5 | 8.1 | +47% | 22,709 | 22,709 |
-| react-dom.development.js, 1.03 MB | 1 | 309 | 404 | +31% | 318,221 | 270,279 |
-| react-dom.development.js, 1.03 MB | 4 | 145 | 153 | +6% | 234,457 | 227,902 |
-| react-dom.development.js, 1.03 MB | 6 | 69.8 | 73.9 | +6% | 210,434 | 207,478 |
-| react-dom.development.js, 1.03 MB | 9 | 25.5 | 30.8 | +21% | 201,502 | 201,701 |
+| JSON, 1.9 KB | 1 | 51,757 | 52,512 | +1% | 717 | 717 |
+| JSON, 1.9 KB | 4 | 29,445 | 28,627 | -3% | 647 | 647 |
+| JSON, 1.9 KB | 6 | 27,761 | 25,583 | -8% | 575 | 575 |
+| JSON, 1.9 KB | 9 | 23,616 | 22,939 | -3% | 576 | 576 |
+| JSON, 1.9 KB | 11 | 625 | 870 | +39% | 504 | 504 |
+| jquery.min.js, 85 KB | 1 | 3,030 | 3,705 | +22% | 37,331 | 35,042 |
+| jquery.min.js, 85 KB | 4 | 1,150 | 1,144 | 0% | 31,402 | 31,402 |
+| jquery.min.js, 85 KB | 6 | 669 | 704 | +5% | 29,596 | 29,596 |
+| jquery.min.js, 85 KB | 9 | 108 | 466 | +331% | 29,478 | 29,478 |
+| jquery.min.js, 85 KB | 11 | 15.0 | 24.2 | +61% | 27,446 | 27,446 |
+| JSON, 94 KB | 1 | 3,591 | 4,485 | +25% | 28,756 | 26,228 |
+| JSON, 94 KB | 4 | 1,424 | 1,395 | -2% | 23,473 | 23,473 |
+| JSON, 94 KB | 6 | 850 | 850 | 0% | 21,813 | 21,813 |
+| JSON, 94 KB | 9 | 127 | 541 | +328% | 21,528 | 21,528 |
+| JSON, 94 KB | 11 | 14.8 | 22.6 | +53% | 19,346 | 19,346 |
+| HTML, 166 KB | 1 | 2,246 | 3,046 | +36% | 42,564 | 36,817 |
+| HTML, 166 KB | 4 | 971 | 958 | -1% | 31,435 | 31,435 |
+| HTML, 166 KB | 6 | 569 | 575 | +1% | 28,786 | 28,786 |
+| HTML, 166 KB | 9 | 104 | 370 | +257% | 28,370 | 28,370 |
+| HTML, 166 KB | 11 | 7.5 | 11.5 | +54% | 25,456 | 25,456 |
+| bootstrap.min.css, 227 KB | 1 | 1,927 | 2,821 | +46% | 45,205 | 39,929 |
+| bootstrap.min.css, 227 KB | 4 | 856 | 828 | -3% | 33,206 | 33,206 |
+| bootstrap.min.css, 227 KB | 6 | 510 | 519 | +2% | 27,432 | 27,432 |
+| bootstrap.min.css, 227 KB | 9 | 113 | 316 | +179% | 26,561 | 26,561 |
+| bootstrap.min.css, 227 KB | 11 | 5.4 | 8.1 | +51% | 22,709 | 22,709 |
+| react-dom.development.js, 1.03 MB | 1 | 310 | 416 | +34% | 318,221 | 270,279 |
+| react-dom.development.js, 1.03 MB | 4 | 145 | 157 | +8% | 234,457 | 227,902 |
+| react-dom.development.js, 1.03 MB | 6 | 70.0 | 75.7 | +8% | 210,434 | 207,478 |
+| react-dom.development.js, 1.03 MB | 9 | 25.3 | 41.1 | +62% | 201,502 | 201,701 |
 | react-dom.development.js, 1.03 MB | 11 | 1.0 | 1.6 | +60% | 183,001 | 183,001 |
 
 At level 9 the C encoder allocates a 32 MiB hash table (2^15 buckets of 256
@@ -273,16 +274,17 @@ three runs and include NGINX itself, about 1.8 MiB before the first request.
 
 | Response | Level | Connections | ngx_brotli, peak | ngx_mbrotli, peak | ngx_brotli, idle | ngx_mbrotli, idle |
 |---|--:|--:|--:|--:|--:|--:|
-| JSON, 1.9 KB | 6 | 64 | 3.3 MiB | 5.4 MiB | 3.3 MiB | 5.4 MiB |
-| jquery.min.js, 85 KB | 6 | 32 | 5.7 MiB | 8.0 MiB | 5.7 MiB | 8.0 MiB |
-| jquery.min.js, 85 KB | 9 | 32 | 33.9 MiB | 9.9 MiB | 3.7 MiB | 9.9 MiB |
-| react-dom.development.js, 1.03 MB | 6 | 32 | 9.2 MiB | 13.6 MiB | 3.4 MiB | 7.7 MiB |
-| react-dom.development.js, 1.03 MB | 11 | 8 | 23.0 MiB | 27.8 MiB | 17.2 MiB | 22.2 MiB |
+| JSON, 1.9 KB | 6 | 64 | 3.3 MiB | 4.8 MiB | 3.3 MiB | 4.8 MiB |
+| jquery.min.js, 85 KB | 6 | 32 | 5.6 MiB | 7.2 MiB | 5.6 MiB | 7.2 MiB |
+| jquery.min.js, 85 KB | 9 | 32 | 33.8 MiB | 9.3 MiB | 3.7 MiB | 9.3 MiB |
+| react-dom.development.js, 1.03 MB | 6 | 32 | 8.9 MiB | 12.5 MiB | 3.2 MiB | 12.5 MiB |
+| react-dom.development.js, 1.03 MB | 11 | 8 | 22.9 MiB | 26.8 MiB | 19.5 MiB | 26.8 MiB |
 
 Idle memory includes encoders that ngx_mbrotli keeps for reuse (up to 4 per
-worker, see `brotli_retention_policy`) and memory that glibc has not returned to
-the system. After level 11 it varied between runs, from 17 to 21 MiB for
-google/ngx_brotli and from 19 to 23 MiB for ngx_mbrotli.
+worker) and memory that glibc has not returned to the system. With the default
+`brotli_retention_policy aggressive`, the kept encoders hold all of their
+buffers, so ngx_mbrotli's idle memory equals its peak; `bounded <size>` or
+`release_all` trade some of that memory for allocations on later responses.
 
 <details>
 <summary>Hardware, build and method</summary>
@@ -304,7 +306,7 @@ google/ngx_brotli and from 19 to 23 MiB for ngx_mbrotli.
 - Brotli built as static libraries with CMake's Release flags,
   `-O3 -DNDEBUG -fPIC`. google/ngx_brotli's README suggests `-march=native`,
   which was not used; ngx_mbrotli is not built with `target-cpu=native` either.
-- ngx_mbrotli 0.2.0 with mbrotli 0.5.7, `cargo build --release` (rustc 1.98.1).
+- ngx_mbrotli 0.2.0 with mbrotli 0.5.9, `cargo build --release` (rustc 1.98.1).
 
 **Configuration**
 
