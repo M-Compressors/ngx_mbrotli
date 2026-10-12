@@ -20,6 +20,20 @@ fn main() {
         .warnings(false)
         .compile("ngx_mbrotli_bitfields");
 
+    // `ngx_feature = "..."` for every feature NGINX was configured with, as
+    // ngx-rust does for itself: `threads` enables `brotli_thread_pool`.
+    println!("cargo::rerun-if-env-changed=DEP_NGINX_FEATURES_CHECK");
+    println!(
+        "cargo::rustc-check-cfg=cfg(ngx_feature, values({}))",
+        env::var("DEP_NGINX_FEATURES_CHECK").unwrap_or_else(|_| "any()".to_owned())
+    );
+    println!("cargo::rerun-if-env-changed=DEP_NGINX_FEATURES");
+    if let Ok(features) = env::var("DEP_NGINX_FEATURES") {
+        for feature in features.split(',').map(str::trim) {
+            println!("cargo::rustc-cfg=ngx_feature=\"{feature}\"");
+        }
+    }
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         // NGINX symbols are resolved when the module is loaded.
         println!("cargo::rustc-link-arg=-undefined");

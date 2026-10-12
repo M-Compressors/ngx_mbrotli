@@ -1,16 +1,26 @@
 //! The body filter's state machine.
 //!
-//! Everything it needs from NGINX (chain links, buffers, the next body filter)
-//! goes through [`Host`]. In NGINX that is a thin wrapper over the C API; in
-//! tests it is a Rust model of the same API, which lets the pointer handling
-//! here run under Miri.
+//! Everything it needs from NGINX (chain links, buffers, the next body filter,
+//! the thread pool) goes through [`Host`]. In NGINX that is a thin wrapper over
+//! the C API; in tests it is a Rust model of the same API, which lets the
+//! pointer handling here run under Miri.
+//!
+//! With `brotli_thread_pool`, the response is encoded by a parallel session:
+//! it cuts the input into segments and queues each one as a task, which the
+//! filter posts to the thread pool. Completed segments are collected by the
+//! next call of the filter, so the host calls it again whenever a task
+//! completes ([`BodyFilter::task_done`]).
 
 use core::fmt;
 use core::mem::MaybeUninit;
 use core::{ptr, slice};
 
+use mbrotli::compressor::parallel::{
+    OwnedParallelTask, ParallelConfig, ParallelEncoderSessionOwned, ParallelEncoderStatus,
+    ParallelProgress, ParallelTaskQueue, SegmentSize, TaskCount,
+};
 use mbrotli::{
-    EncodeError, EncoderConfig, EncoderSessionOwned, EncoderStatus, InputSize, Operation,
+    EncoderConfig, EncoderSessionOwned, EncoderStatus, InputSize, Operation, Progress,
     RetentionPolicy, StreamConfig, Window,
 };
 use ngx::ffi::{NGX_AGAIN, NGX_ERROR, NGX_OK, ngx_buf_t, ngx_chain_t, ngx_int_t, off_t};
@@ -81,6 +91,16 @@ pub trait Host {
     /// Sets or clears this module's bit in `r->connection->buffered`.
     fn set_buffered(&mut self, on: bool);
 
+    /// Queues `task` on the thread pool. Returns it if it cannot be queued.
+    ///
+    /// Once the task has run, the host calls [`BodyFilter::task_done`] and
+    /// then the filter again, from the thread that runs the filter.
+    fn post_task(&mut self, task: OwnedParallelTask) -> Option<OwnedParallelTask>;
+
+    /// Keeps the request from being freed while tasks are posted
+    /// (`r->main->blocked`), or lets it go again.
+    fn set_blocked(&mut self, on: bool);
+
     /// # Safety
     ///
     /// `b` must be a valid buffer.
@@ -115,6 +135,18 @@ pub struct Settings {
     /// `brotli_buffers`.
     pub bufs_num: usize,
     pub bufs_size: usize,
+    /// Set when `brotli_thread_pool` is.
+    pub parallel: Option<Parallel>,
+}
+
+/// How a response is split up for the thread pool.
+#[derive(Copy, Clone, Debug)]
+pub struct Parallel {
+    /// `brotli_parallel_segment_size`.
+    pub segment_size: SegmentSize,
+    /// `brotli_parallel_tasks`: segments queued, running or waiting to be
+    /// sent at once.
+    pub tasks: TaskCount,
 }
 
 /// The window for a response of `content_length` bytes (`-1` if unknown):
@@ -144,11 +176,67 @@ enum Step {
     Declined,
 }
 
+/// The encoder of one response.
+enum Session {
+    Serial(EncoderSessionOwned),
+    Parallel {
+        session: ParallelEncoderSessionOwned,
+        /// Segments the session has queued and the filter has not posted yet.
+        queue: ParallelTaskQueue,
+    },
+}
+
+/// What the encoder needs next; `Pending` only comes from a parallel session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Status {
+    NeedsInput,
+    NeedsOutput,
+    /// Waiting for posted tasks to complete.
+    Pending,
+    Finished,
+}
+
+/// What one call of the encoder did.
+struct Outcome {
+    consumed: usize,
+    produced: usize,
+    status: Status,
+}
+
+impl From<Progress> for Outcome {
+    fn from(progress: Progress) -> Self {
+        Self {
+            consumed: progress.consumed,
+            produced: progress.produced,
+            status: match progress.status {
+                EncoderStatus::NeedsInput => Status::NeedsInput,
+                EncoderStatus::NeedsOutput => Status::NeedsOutput,
+                EncoderStatus::Finished => Status::Finished,
+            },
+        }
+    }
+}
+
+impl From<ParallelProgress> for Outcome {
+    fn from(progress: ParallelProgress) -> Self {
+        Self {
+            consumed: progress.consumed,
+            produced: progress.produced,
+            status: match progress.status {
+                ParallelEncoderStatus::NeedsInput => Status::NeedsInput,
+                ParallelEncoderStatus::NeedsOutput => Status::NeedsOutput,
+                ParallelEncoderStatus::Pending => Status::Pending,
+                ParallelEncoderStatus::Finished => Status::Finished,
+            },
+        }
+    }
+}
+
 /// The state of one response's body filter.
 pub struct BodyFilter<H: Host> {
     host: H,
     settings: Settings,
-    session: Option<EncoderSessionOwned>,
+    session: Option<Session>,
 
     /// Input not yet handed to the encoder.
     input: *mut ngx_chain_t,
@@ -169,9 +257,17 @@ pub struct BodyFilter<H: Host> {
     operation: Operation,
     /// The encoder holds output that did not fit the last buffer.
     redo: bool,
+    /// A posted task has completed: the encoder may have output to deliver.
+    collect: bool,
     nomem: bool,
     done: bool,
     success: bool,
+
+    /// The encoder holds data that has not been sent.
+    buffered: bool,
+    /// Tasks posted to the thread pool whose completion the host has not
+    /// reported yet.
+    in_flight: usize,
 
     bytes_in: u64,
     bytes_out: u64,
@@ -199,9 +295,12 @@ impl<H: Host> BodyFilter<H> {
             bufs: 0,
             operation: Operation::Process,
             redo: false,
+            collect: false,
             nomem: false,
             done: false,
             success: false,
+            buffered: false,
+            in_flight: 0,
             bytes_in: 0,
             bytes_out: 0,
         }
@@ -243,11 +342,59 @@ impl<H: Host> BodyFilter<H> {
         }
     }
 
+    /// Records that a task given to [`Host::post_task`] has run. The filter
+    /// must be called next, unless the request is going away.
+    ///
+    /// The request stays blocked, and buffered, until the last posted task
+    /// is reported: the host still refers to the request until then.
+    #[cfg_attr(
+        not(ngx_feature = "threads"),
+        allow(dead_code, reason = "only NGINX with threads has a thread pool")
+    )]
+    pub fn task_done(&mut self) {
+        debug_assert!(self.in_flight > 0);
+        self.in_flight -= 1;
+        self.collect = true;
+        if self.in_flight == 0 {
+            self.host.set_blocked(false);
+            self.set_buffered(self.buffered);
+        }
+    }
+
+    /// Stops encoding a response that will not be sent: tasks that have not
+    /// started yet are cancelled.
+    #[cfg_attr(
+        not(ngx_feature = "threads"),
+        allow(dead_code, reason = "only NGINX with threads has a thread pool")
+    )]
+    pub fn abandon(&mut self) {
+        self.done = true;
+        self.release_encoder();
+        self.set_buffered(false);
+    }
+
+    fn set_buffered(&mut self, on: bool) {
+        self.buffered = on;
+        self.host.set_buffered(on || self.in_flight > 0);
+    }
+
     fn release_encoder(&mut self) {
-        if let Some(session) = self.session.take()
-            && self.settings.reuse_memory
-        {
-            encoder_pool::release(session.into_compressor());
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let Settings {
+            reuse_memory,
+            retention,
+            ..
+        } = self.settings;
+        if !reuse_memory {
+            return;
+        }
+        match session {
+            Session::Serial(session) => encoder_pool::release(session.into_compressor()),
+            Session::Parallel { session, .. } => {
+                encoder_pool::release_parallel(session.into_compressor(), retention);
+            }
         }
     }
 
@@ -260,7 +407,7 @@ impl<H: Host> BodyFilter<H> {
             if !unsafe { self.host.chain_add_copy(&mut self.input, input) } {
                 return Err(Failed);
             }
-            self.host.set_buffered(true);
+            self.set_buffered(true);
         }
 
         let mut flush = if self.nomem {
@@ -330,37 +477,64 @@ impl<H: Host> BodyFilter<H> {
             input_size,
             reuse_memory,
             retention,
+            parallel,
             ..
         } = self.settings;
 
-        let compressor = if reuse_memory {
-            encoder_pool::acquire(encoder, retention)
-        } else {
-            encoder_pool::build(encoder, retention)
-        };
-        let compressor = compressor.map_err(|err| {
-            self.host
-                .error(format_args!("brotli encoder config failed: {err}"));
-            Failed
-        })?;
+        let session = match parallel {
+            None => {
+                let compressor = if reuse_memory {
+                    encoder_pool::acquire(encoder, retention)
+                } else {
+                    encoder_pool::build(encoder, retention)
+                };
+                let compressor = compressor.map_err(|err| self.config_error(&err))?;
+                let session = compressor
+                    .into_session(StreamConfig::from(input_size))
+                    .map_err(|err| self.encode_error(&err))?;
+                Session::Serial(session)
+            }
 
-        let session = compressor
-            .into_session(StreamConfig::from(input_size))
-            .map_err(|err| self.encode_error(&err))?;
+            Some(Parallel {
+                segment_size,
+                tasks,
+            }) => {
+                // Workers are kept between responses only with reuse on.
+                let retained = if reuse_memory { tasks.get() } else { 0 };
+                let config = ParallelConfig::from(segment_size).with_max_retained_workers(retained);
+                let compressor = if reuse_memory {
+                    encoder_pool::acquire_parallel(encoder, config)
+                } else {
+                    encoder_pool::build_parallel(encoder, config)
+                };
+                let compressor = compressor.map_err(|err| self.config_error(&err))?;
+                let (session, queue) = compressor
+                    .into_session(tasks)
+                    .map_err(|err| self.encode_error(&err))?;
+                Session::Parallel { session, queue }
+            }
+        };
         self.session = Some(session);
 
         self.host.debug(format_args!(
-            "brotli encoder initialized: lvl:{} win:{} reuse:{} retention:{:?}",
+            "brotli encoder initialized: lvl:{} win:{} reuse:{} retention:{:?} parallel:{:?}",
             encoder.quality().get(),
             1usize << encoder.window().bits(),
             reuse_memory,
-            retention
+            retention,
+            parallel
         ));
 
         Ok(())
     }
 
-    fn encode_error(&self, err: &EncodeError) -> Failed {
+    fn config_error(&self, err: &dyn fmt::Display) -> Failed {
+        self.host
+            .error(format_args!("brotli encoder config failed: {err}"));
+        Failed
+    }
+
+    fn encode_error(&self, err: &dyn fmt::Display) -> Failed {
         self.host
             .error(format_args!("brotli encoder failed: {err}"));
         Failed
@@ -378,7 +552,11 @@ impl<H: Host> BodyFilter<H> {
 
     /// Takes the next input buffer, if the encoder needs one.
     fn add_data(&mut self) -> Result<Step, Failed> {
-        if !self.pending_input().is_empty() || self.operation != Operation::Process || self.redo {
+        if !self.pending_input().is_empty()
+            || self.operation != Operation::Process
+            || self.redo
+            || self.collect
+        {
             return Ok(Step::Ok);
         }
 
@@ -442,9 +620,15 @@ impl<H: Host> BodyFilter<H> {
             return Ok(false);
         }
 
-        let b = self.host.create_temp_buf(self.settings.bufs_size);
+        let size = self.settings.bufs_size;
+        let b = self.host.create_temp_buf(size);
         if b.is_null() {
             return Err(Failed);
+        }
+        if self.settings.parallel.is_some() {
+            // A parallel session writes into initialized memory only. The
+            // buffer is recycled, so it is cleared just this once.
+            unsafe { ptr::write_bytes((*b).start, 0, size) };
         }
         self.out_buf = b;
         self.bufs += 1;
@@ -460,14 +644,28 @@ impl<H: Host> BodyFilter<H> {
         let (last, room) =
             unsafe { ((*out_buf).last, (*out_buf).end.offset_from((*out_buf).last)) };
         let room = room as usize;
-        // Buffer memory is uninitialized until the encoder writes it.
-        let output = unsafe { slice::from_raw_parts_mut(last.cast::<MaybeUninit<u8>>(), room) };
+        self.collect = false;
 
-        let session = self.session.as_mut().ok_or(Failed)?;
-        let progress = match session.process_uninit(input, output, self.operation) {
-            Ok(progress) => progress,
-            Err(err) => return Err(self.encode_error(&err)),
+        let outcome = match self.session.as_mut().ok_or(Failed)? {
+            Session::Serial(session) => {
+                // Buffer memory is uninitialized until the encoder writes it.
+                let output =
+                    unsafe { slice::from_raw_parts_mut(last.cast::<MaybeUninit<u8>>(), room) };
+                session
+                    .process_uninit(input, output, self.operation)
+                    .map(Outcome::from)
+                    .map_err(|err| err.to_string())
+            }
+            Session::Parallel { session, .. } => {
+                // Output buffers are cleared when they are created (get_buf).
+                let output = unsafe { slice::from_raw_parts_mut(last, room) };
+                session
+                    .process(input, output, self.operation)
+                    .map(Outcome::from)
+                    .map_err(|err| err.to_string())
+            }
         };
+        let progress = outcome.map_err(|err| self.encode_error(&err))?;
 
         if progress.consumed > 0 {
             unsafe { (*self.in_buf).pos = (*self.in_buf).pos.add(progress.consumed) };
@@ -483,16 +681,24 @@ impl<H: Host> BodyFilter<H> {
         self.bytes_out += progress.produced as u64;
 
         self.host.debug(format_args!(
-            "brotli in:{} consumed:{} out:{} produced:{} op:{:?} status:{:?}",
-            input_len, progress.consumed, room, progress.produced, self.operation, progress.status
+            "brotli in:{} consumed:{} out:{} produced:{} op:{:?} status:{:?} tasks:{}",
+            input_len,
+            progress.consumed,
+            room,
+            progress.produced,
+            self.operation,
+            progress.status,
+            self.in_flight
         ));
 
-        if out_full && progress.status != EncoderStatus::Finished {
+        let ran_inline = self.post_tasks();
+
+        if out_full && progress.status != Status::Finished {
             self.queue_out_buf()?;
         }
 
         match progress.status {
-            EncoderStatus::NeedsOutput => {
+            Status::NeedsOutput => {
                 if progress.produced == 0 {
                     self.host
                         .error(format_args!("brotli encoder made no progress"));
@@ -502,7 +708,24 @@ impl<H: Host> BodyFilter<H> {
                 Ok(Step::Again)
             }
 
-            EncoderStatus::Finished => {
+            Status::Pending => {
+                self.redo = false;
+                if ran_inline {
+                    // Those tasks are complete already.
+                    self.collect = true;
+                    return Ok(Step::Again);
+                }
+                if self.in_flight == 0 {
+                    // Nothing would call the filter again.
+                    self.host
+                        .error(format_args!("brotli encoder waits for no task"));
+                    return Err(Failed);
+                }
+                // Called again once a task completes.
+                Ok(Step::Ok)
+            }
+
+            Status::Finished => {
                 self.redo = false;
                 let b = self.take_out_buf();
                 if b.is_null() {
@@ -514,11 +737,11 @@ impl<H: Host> BodyFilter<H> {
                 self.done = true;
                 self.success = true;
                 self.release_encoder();
-                self.host.set_buffered(false);
+                self.set_buffered(false);
                 Ok(Step::Ok)
             }
 
-            EncoderStatus::NeedsInput => {
+            Status::NeedsInput => {
                 self.redo = false;
                 match self.operation {
                     Operation::Process => {
@@ -544,7 +767,7 @@ impl<H: Host> BodyFilter<H> {
                         unsafe { self.host.set_flush(b) };
                         self.queue(b)?;
 
-                        self.host.set_buffered(false);
+                        self.set_buffered(false);
                         Ok(Step::Ok)
                     }
 
@@ -556,6 +779,32 @@ impl<H: Host> BodyFilter<H> {
                 }
             }
         }
+    }
+
+    /// Posts the tasks a parallel session has queued to the thread pool.
+    /// Returns whether any had to run here instead.
+    fn post_tasks(&mut self) -> bool {
+        let Some(Session::Parallel { queue, .. }) = &self.session else {
+            return false;
+        };
+
+        let mut ran_inline = false;
+        while let Some(task) = queue.try_recv() {
+            match self.host.post_task(task) {
+                None => {
+                    if self.in_flight == 0 {
+                        self.host.set_blocked(true);
+                    }
+                    self.in_flight += 1;
+                }
+                // The thread pool's queue is full: better slow than failed.
+                Some(task) => {
+                    task.run();
+                    ran_inline = true;
+                }
+            }
+        }
+        ran_inline
     }
 
     /// Detaches the current output buffer, allocating an empty one if needed.

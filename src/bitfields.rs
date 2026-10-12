@@ -18,6 +18,13 @@ unsafe extern "C" {
     pub fn ngx_mbrotli_r_prepare_encoded(r: *mut ngx_http_request_t);
     pub fn ngx_mbrotli_r_set_root_tested(r: *mut ngx_http_request_t);
     pub fn ngx_mbrotli_r_set_buffered(r: *mut ngx_http_request_t, flag: ngx_uint_t, on: ngx_uint_t);
+    pub fn ngx_mbrotli_r_output_pending(r: *mut ngx_http_request_t) -> ngx_uint_t;
+    #[cfg(ngx_feature = "threads")]
+    pub fn ngx_mbrotli_r_set_blocked(r: *mut ngx_http_request_t, on: ngx_uint_t);
+    #[cfg(ngx_feature = "threads")]
+    pub fn ngx_mbrotli_r_thread_done(r: *mut ngx_http_request_t) -> ngx_uint_t;
+    #[cfg(ngx_feature = "threads")]
+    pub fn ngx_mbrotli_r_thread_resume(r: *mut ngx_http_request_t);
 
     fn ngx_mbrotli_buf_flags(b: *mut ngx_buf_t) -> ngx_uint_t;
     pub fn ngx_mbrotli_buf_set_recycled(b: *mut ngx_buf_t);

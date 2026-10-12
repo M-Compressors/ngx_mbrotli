@@ -10,6 +10,11 @@
 //! - upstream frees each input buffer and every chain link it passes as soon
 //!   as the call returns and the buffer is drained, so holding on to either
 //!   is a use-after-free.
+//!
+//! The thread pool is a queue that tests run on their own schedule: a posted
+//! task stays queued until a test runs it and reports its completion, as the
+//! NGINX event loop would. Or it is made of real threads ([`Threads`]), so
+//! that Miri checks what the tasks share with the filter for data races.
 
 use core::cell::RefCell;
 use core::ffi::c_void;
@@ -17,14 +22,18 @@ use core::fmt;
 use core::ptr;
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{HashSet, VecDeque};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
+use mbrotli::compressor::parallel::{OwnedParallelTask, SegmentSize, TaskCount};
 use mbrotli::{
     DecodeOperation, DecodeStreamConfig, DecoderConfig, DecoderStatus, Decompressor, EncoderConfig,
     InputSize, Quality, RetentionPolicy, Window,
 };
 use ngx::ffi::{NGX_AGAIN, NGX_ERROR, NGX_OK, ngx_buf_t, ngx_chain_t, ngx_int_t, off_t};
 
-use super::{BodyFilter, BufFlags, Host, Settings, window_bits};
+use super::{BodyFilter, BufFlags, Host, Parallel, Settings, window_bits};
 
 /// The request pool, the client and the connection, as the filter sees them.
 struct Model {
@@ -48,6 +57,55 @@ struct Model {
 
     buffered: bool,
     errors: RefCell<Vec<String>>,
+
+    /// Tasks posted to the thread pool and not run yet.
+    tasks: VecDeque<OwnedParallelTask>,
+    /// Tasks posted in all.
+    posted: usize,
+    /// The thread pool's queue is full: posting fails.
+    overflow: bool,
+    /// `r->main->blocked`.
+    blocked: bool,
+    /// Runs posted tasks instead of `tasks`.
+    threads: Option<Threads>,
+}
+
+/// A thread pool: its threads take posted tasks, run them and report each
+/// completion, which the test hands to the filter as the event loop does.
+struct Threads {
+    tasks: Sender<OwnedParallelTask>,
+    done: Receiver<()>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl Threads {
+    fn new(count: usize) -> Self {
+        let (tasks, queue) = channel::<OwnedParallelTask>();
+        let queue = Arc::new(Mutex::new(queue));
+        let (done_tx, done) = channel();
+        let workers = (0..count)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let done = done_tx.clone();
+                thread::spawn(move || {
+                    loop {
+                        let task = queue.lock().unwrap().recv();
+                        let Ok(task) = task else {
+                            return;
+                        };
+                        task.run();
+                        // The test may have finished with the filter already.
+                        let _ = done.send(());
+                    }
+                })
+            })
+            .collect();
+        Self {
+            tasks,
+            done,
+            workers,
+        }
+    }
 }
 
 impl Model {
@@ -65,6 +123,11 @@ impl Model {
             last: None,
             buffered: false,
             errors: RefCell::new(Vec::new()),
+            tasks: VecDeque::new(),
+            posted: 0,
+            overflow: false,
+            blocked: false,
+            threads: None,
         }
     }
 
@@ -126,6 +189,14 @@ impl Drop for Model {
         }
         for (p, layout) in self.memory.drain(..) {
             unsafe { dealloc(p, layout) };
+        }
+
+        // NGINX stops its thread pools when the worker exits.
+        if let Some(Threads { tasks, workers, .. }) = self.threads.take() {
+            drop(tasks);
+            for worker in workers {
+                worker.join().unwrap();
+            }
         }
     }
 }
@@ -253,6 +324,23 @@ impl Host for Model {
         self.buffered = on;
     }
 
+    fn post_task(&mut self, task: OwnedParallelTask) -> Option<OwnedParallelTask> {
+        if self.overflow {
+            return Some(task);
+        }
+        match &self.threads {
+            Some(threads) => threads.tasks.send(task).unwrap(),
+            None => self.tasks.push_back(task),
+        }
+        self.posted += 1;
+        None
+    }
+
+    fn set_blocked(&mut self, on: bool) {
+        assert_ne!(self.blocked, on, "blocked twice or unblocked twice");
+        self.blocked = on;
+    }
+
     unsafe fn buf_flags(&self, b: *const ngx_buf_t) -> BufFlags {
         let b = unsafe { &*b };
         BufFlags {
@@ -365,6 +453,34 @@ impl Upstream {
         rc
     }
 
+    /// The thread pool runs the oldest posted task, and the event loop reports
+    /// its completion and calls the filter again.
+    fn complete(&mut self, filter: &mut BodyFilter<Model>) -> ngx_int_t {
+        let task = filter
+            .host_mut()
+            .tasks
+            .pop_front()
+            .expect("a task is posted");
+        task.run();
+        filter.task_done();
+        self.resume(filter)
+    }
+
+    /// Completes posted tasks and sends write events until the response ends.
+    fn finish(&mut self, filter: &mut BodyFilter<Model>) {
+        let mut calls = 0;
+        while filter.host().last.is_none() || !filter.host().tasks.is_empty() {
+            calls += 1;
+            assert!(calls < 100_000, "the response never completes");
+            let rc = if filter.host().tasks.is_empty() {
+                self.resume(filter)
+            } else {
+                self.complete(filter)
+            };
+            assert_ne!(rc, NGX_ERROR as ngx_int_t);
+        }
+    }
+
     fn release_drained(&mut self) {
         self.held.retain(|&(b, data)| {
             let drained = unsafe { (*b).pos == (*b).last && (*b).file_pos == (*b).file_last };
@@ -396,11 +512,27 @@ fn settings(bufs_num: usize, bufs_size: usize) -> Settings {
         retention: RetentionPolicy::Bounded { max_bytes: 1 << 20 },
         bufs_num,
         bufs_size,
+        parallel: None,
     }
 }
 
 fn filter(budget: Option<usize>, bufs_num: usize, bufs_size: usize) -> BodyFilter<Model> {
     BodyFilter::new(Model::new(budget), settings(bufs_num, bufs_size))
+}
+
+/// The smallest segment there is.
+const SEGMENT: usize = 64 << 10;
+
+/// A filter with `brotli_thread_pool`, cutting the response into 64 KiB
+/// segments and keeping at most `tasks` of them at once.
+fn parallel_filter(budget: Option<usize>, tasks: usize) -> BodyFilter<Model> {
+    let mut settings = settings(4, 4096);
+    settings.encoder = settings.encoder.with_quality(Quality::Q1);
+    settings.parallel = Some(Parallel {
+        segment_size: SegmentSize::try_from(SEGMENT).unwrap(),
+        tasks: TaskCount::try_from(tasks).unwrap(),
+    });
+    BodyFilter::new(Model::new(budget), settings)
 }
 
 fn text(len: usize) -> Vec<u8> {
@@ -582,4 +714,222 @@ fn window_follows_known_length() {
     assert_eq!(window_bits(1025, 19), 11);
     assert_eq!(window_bits(1 << 30, 19), 19);
     assert_eq!(window_bits(1 << 30, 24), 24);
+}
+
+#[test]
+fn parallel_segments_round_trip() {
+    // Three full segments and a short one, arriving in 16 KiB chunks.
+    let body = text(3 * SEGMENT + 1000);
+    let mut f = parallel_filter(None, 2);
+    let mut up = Upstream::default();
+
+    let mut held = false;
+    for chunk in body.chunks(16 << 10) {
+        assert_ne!(
+            up.send(&mut f, &[Part::Data(chunk)]),
+            NGX_ERROR as ngx_int_t
+        );
+        assert!(f.host().buffered);
+        // With both tasks posted, the next segment waits for one of them: the
+        // filter keeps the input it cannot take yet, until a task completes.
+        while !up.held.is_empty() {
+            held = true;
+            assert_eq!(f.host().tasks.len(), 2);
+            up.complete(&mut f);
+        }
+    }
+    assert!(held, "the window never filled up");
+    up.send(&mut f, &[Part::Last(&[])]);
+    up.finish(&mut f);
+
+    let model = f.host();
+    assert_eq!(decode(&model.sent), body);
+    assert_eq!(model.posted, 4);
+    assert_eq!(model.last, Some(model.sent.len()));
+    assert!(!model.buffered);
+    assert!(!model.blocked);
+    assert_eq!(
+        f.sizes(),
+        Some((body.len() as u64, model.sent.len() as u64))
+    );
+    assert!(model.errors.borrow().is_empty());
+    assert!(up.held.is_empty());
+}
+
+#[test]
+fn parallel_short_response_is_one_task() {
+    let body = text(3000);
+    let mut f = parallel_filter(None, 4);
+    let mut up = Upstream::default();
+
+    // The response waits for its task, holding nothing upstream owns.
+    assert_eq!(up.send(&mut f, &[Part::Last(&body)]), OK);
+    assert!(f.host().sent.is_empty());
+    assert!(f.host().buffered && f.host().blocked);
+    assert!(up.held.is_empty());
+
+    assert_eq!(up.complete(&mut f), OK);
+    let model = f.host();
+    assert!(f.is_done());
+    assert_eq!(model.posted, 1);
+    assert_eq!(decode(&model.sent), body);
+    assert!(!model.buffered && !model.blocked);
+}
+
+#[test]
+fn parallel_flush_waits_for_its_segments() {
+    let (a, b) = (text(SEGMENT + 500), text(800));
+    let mut f = parallel_filter(None, 4);
+    let mut up = Upstream::default();
+
+    assert_eq!(up.send(&mut f, &[Part::Flush(&a)]), OK);
+    assert!(f.host().flushes.is_empty());
+    while !f.host().tasks.is_empty() {
+        up.complete(&mut f);
+    }
+    let model = f.host();
+    assert_eq!(model.flushes, [model.sent.len()]);
+    assert_eq!(decode_prefix(&model.sent), a);
+    assert!(!model.buffered && !model.blocked);
+
+    up.send(&mut f, &[Part::Last(&b)]);
+    up.finish(&mut f);
+    assert_eq!(decode(&f.host().sent), [a, b].concat());
+}
+
+#[test]
+fn parallel_request_stays_buffered_until_every_task_is_reported() {
+    let body = text(2 * SEGMENT);
+    let mut f = parallel_filter(None, 2);
+    let mut up = Upstream::default();
+
+    up.send(&mut f, &[Part::Last(&body)]);
+    let tasks: Vec<_> = f.host_mut().tasks.drain(..).collect();
+    assert_eq!(tasks.len(), 2);
+    // Both tasks run, but the event loop has reported only one of them.
+    tasks.into_iter().for_each(|task| task.run());
+    f.task_done();
+    up.resume(&mut f);
+
+    // The stream is complete, but the event loop still refers to the request.
+    assert!(f.is_done());
+    assert_eq!(f.host().last, Some(f.host().sent.len()));
+    assert!(f.host().buffered && f.host().blocked);
+
+    f.task_done();
+    assert!(!f.host().buffered && !f.host().blocked);
+    assert_eq!(decode(&f.host().sent), body);
+}
+
+#[test]
+fn parallel_tasks_run_inline_when_the_pool_is_full() {
+    let body = text(2 * SEGMENT + 100);
+    let mut f = parallel_filter(None, 2);
+    f.host_mut().overflow = true;
+    let mut up = Upstream::default();
+
+    assert_eq!(up.send(&mut f, &[Part::Last(&body)]), OK);
+    let model = f.host();
+    assert!(f.is_done());
+    assert_eq!(model.posted, 0);
+    assert!(!model.blocked && !model.buffered);
+    assert_eq!(decode(&model.sent), body);
+}
+
+#[test]
+fn parallel_slow_client_with_few_small_buffers() {
+    let body = text(SEGMENT + 3000);
+    let mut settings = settings(2, 64);
+    settings.parallel = Some(Parallel {
+        segment_size: SegmentSize::try_from(SEGMENT).unwrap(),
+        tasks: TaskCount::ONE,
+    });
+    let mut f = BodyFilter::new(Model::new(Some(997)), settings);
+    let mut up = Upstream::default();
+
+    up.send(&mut f, &[Part::Data(&body)]);
+    up.send(&mut f, &[Part::Last(&[])]);
+    up.finish(&mut f);
+
+    let model = f.host();
+    assert_eq!(model.temp_bufs, 2);
+    assert_eq!(decode(&model.sent), body);
+    assert!(!model.buffered && !model.blocked);
+    assert!(up.held.is_empty());
+}
+
+#[test]
+fn abandoned_response_lets_its_tasks_finish() {
+    let body = text(2 * SEGMENT);
+    let mut f = parallel_filter(None, 2);
+    let mut up = Upstream::default();
+
+    up.send(&mut f, &[Part::Last(&body)]);
+    assert_eq!(f.host().tasks.len(), 2);
+
+    // The request is terminated: its tasks still run, cancelled.
+    f.abandon();
+    assert!(f.is_done());
+    while let Some(task) = f.host_mut().tasks.pop_front() {
+        task.run();
+        f.task_done();
+    }
+    assert!(!f.host().blocked && !f.host().buffered);
+    assert_eq!(f.sizes(), None);
+}
+
+/// The event loop reports a task completed on a thread, waiting for one if
+/// `wait`, and runs the filter again. Returns whether there was one.
+fn report(f: &mut BodyFilter<Model>, up: &mut Upstream, wait: bool) -> bool {
+    let threads = f.host().threads.as_ref().unwrap();
+    let done = if wait {
+        threads.done.recv().is_ok()
+    } else {
+        threads.done.try_recv().is_ok()
+    };
+    if done {
+        f.task_done();
+        assert_ne!(up.resume(f), NGX_ERROR as ngx_int_t);
+    }
+    done
+}
+
+#[test]
+fn parallel_tasks_on_threads() {
+    // Segments are encoded on two threads while the filter takes input,
+    // collects finished segments and sends them on this one.
+    let body = text(3 * SEGMENT + 1000);
+    let mut f = parallel_filter(None, 2);
+    f.host_mut().threads = Some(Threads::new(2));
+    let mut up = Upstream::default();
+    let mut reported = 0;
+
+    for chunk in body.chunks(16 << 10) {
+        assert_ne!(
+            up.send(&mut f, &[Part::Data(chunk)]),
+            NGX_ERROR as ngx_int_t
+        );
+        while report(&mut f, &mut up, false) {
+            reported += 1;
+        }
+        // With the window full, the input waits for a task to complete.
+        while !up.held.is_empty() {
+            assert!(report(&mut f, &mut up, true));
+            reported += 1;
+        }
+    }
+    up.send(&mut f, &[Part::Last(&[])]);
+    while f.host().last.is_none() || reported < f.host().posted {
+        assert!(
+            report(&mut f, &mut up, true),
+            "the response never completes"
+        );
+        reported += 1;
+    }
+
+    let model = f.host();
+    assert_eq!(decode(&model.sent), body);
+    assert_eq!(model.posted, 4);
+    assert!(!model.buffered && !model.blocked);
+    assert!(model.errors.borrow().is_empty());
 }

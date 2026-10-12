@@ -74,6 +74,61 @@ ngx_mbrotli_r_set_buffered(ngx_http_request_t *r, ngx_uint_t flag,
 }
 
 
+/* Whether the write filter has anything left to send for `r`. */
+ngx_uint_t
+ngx_mbrotli_r_output_pending(ngx_http_request_t *r)
+{
+    return r->out != NULL
+           || (r->connection->buffered & NGX_LOWLEVEL_BUFFERED);
+}
+
+
+#if (NGX_THREADS)
+
+/* Keeps the request from being freed while thread tasks refer to it. */
+void
+ngx_mbrotli_r_set_blocked(ngx_http_request_t *r, ngx_uint_t on)
+{
+    if (on) {
+        r->main->blocked++;
+
+    } else {
+        r->main->blocked--;
+    }
+}
+
+
+/*
+ * Called when a thread task of `r` completes. Returns whether the request
+ * has been finalized or terminated meanwhile, and so is only waiting for its
+ * tasks to let go of it.
+ */
+ngx_uint_t
+ngx_mbrotli_r_thread_done(ngx_http_request_t *r)
+{
+    ngx_http_set_log_request(r->connection->log, r);
+
+    return r->done || r->main->terminated;
+}
+
+
+/*
+ * Resumes the connection of `r` after a thread task, as a write event would:
+ * its active request may be a subrequest whose output waits for the filter,
+ * or a finalized or terminated request waiting for the task to let go.
+ */
+void
+ngx_mbrotli_r_thread_resume(ngx_http_request_t *r)
+{
+    ngx_connection_t  *c;
+
+    c = r->connection;
+    c->write->handler(c->write);
+}
+
+#endif
+
+
 /* ngx_buf_t */
 
 #define NGX_MBROTLI_BUF_IN_MEMORY  0x01

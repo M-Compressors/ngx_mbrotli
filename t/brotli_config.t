@@ -19,7 +19,7 @@ use Test::Nginx;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http/)->plan(16);
+my $t = Test::Nginx->new()->has(qw/http/)->plan(25);
 
 ###############################################################################
 
@@ -46,6 +46,34 @@ like(check($t, 'brotli_retention_policy bounded 0;'), $ok, 'bounded 0');
 
 like(check($t, '', 'brotli_retention_policy release_all; brotli_reuse_memory on;'),
 	$ok, 'location level');
+
+like(check($t, 'brotli_thread_pool off; brotli_parallel_segment_size 256k; '
+		. 'brotli_parallel_tasks 8;'),
+	$ok, 'parallel directives');
+
+SKIP: {
+skip 'no threads', 3 unless $t->has_module('--with-threads');
+
+like(check($t, 'brotli_thread_pool brotli;', 'brotli_thread_pool off;',
+		'thread_pool brotli threads=2;'),
+	$ok, 'thread pool');
+
+like(check($t, 'brotli_thread_pool default;'), $ok, 'default thread pool');
+
+like(check($t, 'brotli_thread_pool nope;'),
+	qr/unknown thread pool "nope"/,
+	'unknown thread pool');
+
+}
+
+SKIP: {
+skip 'threads', 1 if $t->has_module('--with-threads');
+
+like(check($t, 'brotli_thread_pool brotli;'),
+	qr/"brotli_thread_pool" requires NGINX built with --with-threads/,
+	'thread pool without threads');
+
+}
 
 # invalid configurations
 
@@ -90,21 +118,40 @@ like(check($t, 'brotli_buffers 4;'),
 	qr/invalid number of arguments in "brotli_buffers" directive/,
 	'buffers arguments');
 
+like(check($t, 'brotli_thread_pool off; brotli_thread_pool off;'),
+	qr/"brotli_thread_pool" directive is duplicate/,
+	'duplicate thread pool');
+
+like(check($t, 'brotli_parallel_segment_size 32k;'),
+	qr/must be between 64k and 16m/,
+	'segment size too small');
+
+like(check($t, 'brotli_parallel_segment_size 32m;'),
+	qr/must be between 64k and 16m/,
+	'segment size too large');
+
+like(check($t, 'brotli_parallel_tasks 0;'),
+	qr/value must be between 1 and 1024/,
+	'parallel tasks bounds');
+
 ###############################################################################
 
-# Writes nginx.conf with `$http` in the http block and `$location` in a
-# location, and returns the output of `nginx -t`. Takes `$t` as an argument:
-# a sub closing over it would keep it alive until global destruction, too late
-# for its end-of-test checks.
+# Writes nginx.conf with `$http` in the http block, `$location` in a location
+# and `$main` in the main context, and returns the output of `nginx -t`. Takes
+# `$t` as an argument: a sub closing over it would keep it alive until global
+# destruction, too late for its end-of-test checks.
 sub check {
-	my ($t, $http, $location) = @_;
+	my ($t, $http, $location, $main) = @_;
 	$location //= '';
+	$main //= '';
 
 	$t->write_file_expand('nginx.conf', <<"EOF");
 
 %%TEST_GLOBALS%%
 
 daemon off;
+
+$main
 
 events {
 }

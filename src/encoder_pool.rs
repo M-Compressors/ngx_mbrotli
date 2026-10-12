@@ -5,9 +5,15 @@
 //! and staging buffers instead of allocating them for every request
 //! (`brotli_reuse_memory`). How much an idle encoder keeps allocated is its
 //! retention policy (`brotli_retention_policy`).
+//!
+//! Parallel compressors (`brotli_thread_pool`) are kept in a list of their own:
+//! what they keep between responses is their idle segment workers.
 
 use core::cell::RefCell;
 
+use mbrotli::compressor::parallel::{
+    ParallelCompressor, ParallelConfig, ParallelConfigError, ParallelRetentionPolicy,
+};
 use mbrotli::{Compressor, ConfigError, EncoderConfig, RetentionPolicy};
 
 /// How many idle compressors a worker keeps.
@@ -22,6 +28,9 @@ pub const DEFAULT_RETENTION: RetentionPolicy = RetentionPolicy::Aggressive;
 thread_local! {
     /// Idle compressors, least recently released first.
     static IDLE: RefCell<Vec<Compressor>> = const { RefCell::new(Vec::new()) };
+
+    /// Idle parallel compressors, least recently released first.
+    static IDLE_PARALLEL: RefCell<Vec<ParallelCompressor>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Builds a compressor that bypasses the cache.
@@ -63,12 +72,62 @@ pub fn acquire(
 /// Returns `compressor` to the cache, evicting the least recently released
 /// idle compressor when the cache is full.
 pub fn release(compressor: Compressor) {
-    IDLE.with_borrow_mut(|idle| {
-        if idle.len() >= MAX_IDLE {
-            idle.remove(0);
-        }
-        idle.push(compressor);
+    IDLE.with_borrow_mut(|idle| push_idle(idle, compressor));
+}
+
+/// Builds a parallel compressor that bypasses the cache.
+pub fn build_parallel(
+    config: EncoderConfig,
+    parallel: ParallelConfig,
+) -> Result<ParallelCompressor, ParallelConfigError> {
+    ParallelCompressor::new(config, parallel)
+}
+
+/// Returns a parallel compressor for `config` and `parallel`, preferring an
+/// idle one: with the same encoder configuration, it keeps its workers.
+pub fn acquire_parallel(
+    config: EncoderConfig,
+    parallel: ParallelConfig,
+) -> Result<ParallelCompressor, ParallelConfigError> {
+    let cached = IDLE_PARALLEL.with_borrow_mut(|idle| {
+        let index = idle
+            .iter()
+            .rposition(|c| *c.encoder_config() == config)
+            .or_else(|| idle.len().checked_sub(1))?;
+        Some(idle.remove(index))
     });
+
+    match cached {
+        Some(mut compressor) => {
+            if *compressor.encoder_config() != config {
+                compressor.reconfigure(config)?;
+            }
+            if *compressor.parallel_config() != parallel {
+                compressor.reconfigure_parallel(parallel);
+            }
+            Ok(compressor)
+        }
+        None => build_parallel(config, parallel),
+    }
+}
+
+/// Returns `compressor` to the cache, keeping as much of its workers'
+/// memory as `retention` allows.
+pub fn release_parallel(mut compressor: ParallelCompressor, retention: RetentionPolicy) {
+    compressor.trim(match retention {
+        RetentionPolicy::Aggressive => ParallelRetentionPolicy::Aggressive,
+        RetentionPolicy::CurrentConfig => ParallelRetentionPolicy::CurrentPlan,
+        RetentionPolicy::Bounded { max_bytes } => ParallelRetentionPolicy::Bounded { max_bytes },
+        RetentionPolicy::ReleaseAll => ParallelRetentionPolicy::ReleaseAll,
+    });
+    IDLE_PARALLEL.with_borrow_mut(|idle| push_idle(idle, compressor));
+}
+
+fn push_idle<T>(idle: &mut Vec<T>, compressor: T) {
+    if idle.len() >= MAX_IDLE {
+        idle.remove(0);
+    }
+    idle.push(compressor);
 }
 
 #[cfg(test)]

@@ -13,6 +13,50 @@ keep working unchanged.
 
 Both modules are built into one dynamic library, so one `load_module` line loads both.
 
+## Example
+
+Compression on a thread pool, so that long responses and high levels do not hold
+up the worker's event loop. NGINX must be built with `--with-threads`:
+
+```nginx
+load_module /path/to/libngx_mbrotli.so;
+
+# Each worker process gets its own 4 threads.
+thread_pool brotli threads=4;
+
+http {
+    brotli on;
+    brotli_comp_level 6;
+    brotli_types text/plain text/css application/javascript application/json
+                 image/svg+xml;
+    brotli_static on;
+
+    # Responses are cut into 1m segments; up to 4 of them per response are
+    # compressed at once on the pool's threads.
+    brotli_thread_pool brotli;
+    brotli_parallel_segment_size 1m;
+    brotli_parallel_tasks 4;
+
+    server {
+        listen 80;
+
+        location / {
+            root /var/www;
+        }
+
+        # Small API responses: compressing them in the event loop is cheaper.
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080;
+            brotli_thread_pool off;
+        }
+    }
+}
+```
+
+Without `brotli_thread_pool` the module compresses in the event loop, as
+google/ngx_brotli does. See [Configuration directives](#configuration-directives)
+for every directive.
+
 ## Building
 
 Requirements:
@@ -145,6 +189,62 @@ when `brotli_reuse_memory` is on.
 Idle encoders are reused only by locations with the same retention policy; when a
 worker's 4 idle slots are full, the least recently used encoder is freed.
 
+With `brotli_thread_pool`, an idle encoder keeps the encoders of up to
+`brotli_parallel_tasks` segments, and the policy applies to all of them
+together.
+
+*Not in google/ngx_brotli.*
+
+### `brotli_thread_pool`
+
+- **syntax**: `brotli_thread_pool <name> | off`
+- **default**: `off`
+- **context**: `http`, `server`, `location`
+
+Compresses responses on the named thread pool instead of in the worker's event
+loop, so that a long response or a high `brotli_comp_level` does not hold up the
+worker's other connections. The pool is declared with
+[`thread_pool`](https://nginx.org/en/docs/ngx_core_module.html#thread_pool) in the
+main context; a pool named `default` with 32 threads exists without being
+declared. Requires NGINX built with `--with-threads`.
+
+A response is cut into segments of `brotli_parallel_segment_size`, and up to
+`brotli_parallel_tasks` of them are compressed on the pool's threads at once. They
+are sent in order as they complete, while the next segments are read. A response
+that fits in one segment is compressed in one piece by one thread. Segments are
+compressed independently: back-references do not cross segment boundaries, so a
+response longer than one segment compresses slightly worse, and a flush (for
+example with `proxy_buffering off`) ends the current segment early.
+
+Every worker process has its own threads, so `worker_processes` times the pool's
+`threads` run at once. A response being compressed holds up to
+`brotli_parallel_tasks` + 1 segments of input, their compressed output, and an
+encoder for each segment.
+
+*Not in google/ngx_brotli.*
+
+### `brotli_parallel_segment_size`
+
+- **syntax**: `brotli_parallel_segment_size <size>`
+- **default**: `1m`
+- **context**: `http`, `server`, `location`
+
+Sets the size of the segments a response is cut into for `brotli_thread_pool`,
+from `64k` to `16m`. Smaller segments spread shorter responses over more threads
+and compress slightly worse.
+
+*Not in google/ngx_brotli.*
+
+### `brotli_parallel_tasks`
+
+- **syntax**: `brotli_parallel_tasks <number>`
+- **default**: `4`
+- **context**: `http`, `server`, `location`
+
+Sets how many segments of one response may be compressed, or wait to be sent, at
+once with `brotli_thread_pool`, from `1` to `1024`. When they all are, NGINX stops
+reading the response until the first of them has been sent.
+
 *Not in google/ngx_brotli.*
 
 ## Variables
@@ -183,6 +283,8 @@ is on.
   Set `brotli_reuse_memory off` to allocate per response as google/ngx_brotli
   does. Peak memory still follows the number of responses being compressed at
   once, times the working set that `brotli_comp_level` and `brotli_window` need.
+- **Responses can be compressed on a thread pool** (`brotli_thread_pool`), in
+  segments that are compressed in parallel.
 - **The size hint comes from `Content-Length`.** When the length is known it is
   passed to the encoder, which uses it to choose a match finder at levels 4–9.
 - **Fonts are compressed in Brotli's font mode.** Responses whose type is an
@@ -345,6 +447,14 @@ accessors that bindgen generates for `ngx_http_request_t` do not match the C
 compiler's layout in NGINX 1.30 (they are two bits off from `uri_changes`
 onwards), so they cannot be used safely.
 
+With `brotli_thread_pool`, each segment becomes an `ngx_thread_task_t`. Its
+completion handler runs in the event loop and calls the brotli filter to send
+what is ready, then runs the connection's write handler, as a write event would.
+While tasks are posted, the request is blocked (`r->main->blocked`), so that
+terminating it waits for them, and stays buffered, so that it is not finalized
+before the last completion handler has run, even when the response has already
+been sent.
+
 ## Testing
 
 Unit tests do not need a running NGINX:
@@ -369,7 +479,8 @@ TEST_NGINX_GLOBALS="load_module $PWD/target/release/libngx_mbrotli.so;" \
 CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`:
 
 - rustfmt and clippy;
-- unit and integration tests against NGINX 1.28, 1.30 and 1.31;
+- unit and integration tests against NGINX 1.28, 1.30 and 1.31, built with
+  `--with-threads`; clippy also checks a build without it;
 - the integration tests under AddressSanitizer and LeakSanitizer, with NGINX
   and the module (including the Rust standard library) instrumented, and
   `NGX_DEBUG_PALLOC` so that each pool allocation is checked on its own;
@@ -377,7 +488,10 @@ CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`:
   through a small `Host` trait, so Miri runs it against a model of NGINX's
   buffer and chain API (`src/body/tests.rs`). The model frees drained input
   buffers and chain links, and leaves output buffers uninitialized, so stale
-  pointers and reads of unwritten output show up as undefined behaviour.
+  pointers and reads of unwritten output show up as undefined behaviour. Its
+  thread pool is either a queue that the tests run and report on their own
+  schedule, or real threads, so that Miri also looks for data races between
+  the filter and the segments being encoded.
 
 Changelogs and versions are managed with [Sampo](https://github.com/bruits/sampo).
 Every user-facing change needs a changeset, a short Markdown file in

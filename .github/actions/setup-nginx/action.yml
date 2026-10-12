@@ -14,8 +14,13 @@ inputs:
   configure-args:
     description: Extra `./configure` arguments, as shell words.
     default: ""
+  threads:
+    description: Configure with `--with-threads`, for `brotli_thread_pool`.
+    default: "true"
   variant:
-    description: Names the build in the cache key when `configure-args` is set.
+    description: >
+      Names the build, in its directory and cache key, when `configure-args`
+      or `threads` is set.
     default: default
 
 runs:
@@ -32,8 +37,8 @@ runs:
       id: cache
       uses: actions/cache@v6
       with:
-        path: ${{ runner.temp }}/nginx-${{ inputs.version }}
-        key: nginx-${{ inputs.version }}-${{ inputs.variant }}-build-${{ inputs.build }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-nginx/action.yml') }}
+        path: ${{ runner.temp }}/nginx-${{ inputs.version }}-${{ inputs.variant }}
+        key: nginx-${{ inputs.version }}-${{ inputs.variant }}-threads-${{ inputs.threads }}-build-${{ inputs.build }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-nginx/action.yml') }}
 
     - name: Download and configure NGINX
       if: steps.cache.outputs.cache-hit != 'true'
@@ -41,12 +46,19 @@ runs:
       working-directory: ${{ runner.temp }}
       env:
         VERSION: ${{ inputs.version }}
+        DIR: nginx-${{ inputs.version }}-${{ inputs.variant }}
         BUILD: ${{ inputs.build }}
+        THREADS: ${{ inputs.threads }}
         CONFIGURE_ARGS: ${{ inputs.configure-args }}
       run: |
         set -euo pipefail
-        curl -sSfL "https://nginx.org/download/nginx-$VERSION.tar.gz" | tar xz
-        cd "nginx-$VERSION"
+        mkdir "$DIR"
+        curl -sSfL "https://nginx.org/download/nginx-$VERSION.tar.gz" \
+          | tar xz --strip-components=1 -C "$DIR"
+        cd "$DIR"
+        if [ "$THREADS" = true ]; then
+          CONFIGURE_ARGS="--with-threads $CONFIGURE_ARGS"
+        fi
         eval "./configure --with-compat --with-debug --with-http_ssl_module $CONFIGURE_ARGS"
         if [ "$BUILD" = true ]; then
           make -j"$(nproc)"
@@ -55,7 +67,7 @@ runs:
     - name: Export paths
       shell: bash
       env:
-        DIR: ${{ runner.temp }}/nginx-${{ inputs.version }}
+        DIR: ${{ runner.temp }}/nginx-${{ inputs.version }}-${{ inputs.variant }}
       run: |
         dir="$DIR"
         echo "NGINX_BUILD_DIR=$dir/objs" >> "$GITHUB_ENV"

@@ -2,13 +2,15 @@
 //!
 //! Directives and behaviour follow google/ngx_brotli; output buffering follows
 //! the stock gzip filter, so `brotli_buffers` is honoured rather than ignored.
+//!
+//! With `brotli_thread_pool`, responses are encoded in segments on that
+//! NGINX thread pool (see [`threads`]).
 
 use core::ffi::{c_char, c_void};
 use core::{fmt, ptr};
 
-use mbrotli::{
-    CompressionMode, ConfigError, EncoderConfig, InputSize, Quality, RetentionPolicy, Window,
-};
+use mbrotli::compressor::parallel::{OwnedParallelTask, SegmentSize, TaskCount};
+use mbrotli::{CompressionMode, EncoderConfig, InputSize, Quality, RetentionPolicy, Window};
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, Pool};
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12, NGX_ERROR,
@@ -31,11 +33,11 @@ use ngx::{ngx_conf_log_error, ngx_log_debug_mask, ngx_log_error, ngx_string};
 use crate::accept_encoding;
 use crate::bitfields::{
     buf_flags, ngx_mbrotli_buf_set_flush, ngx_mbrotli_buf_set_last_buf,
-    ngx_mbrotli_buf_set_recycled, ngx_mbrotli_r_header_only, ngx_mbrotli_r_prepare_encoded,
-    ngx_mbrotli_r_set_buffered, ngx_mbrotli_r_set_gzip_vary, ngx_mbrotli_var_set,
-    ngx_mbrotli_var_set_not_found,
+    ngx_mbrotli_buf_set_recycled, ngx_mbrotli_r_header_only, ngx_mbrotli_r_output_pending,
+    ngx_mbrotli_r_prepare_encoded, ngx_mbrotli_r_set_buffered, ngx_mbrotli_r_set_gzip_vary,
+    ngx_mbrotli_var_set, ngx_mbrotli_var_set_not_found,
 };
-use crate::body::{self, BodyFilter, BufFlags, Host, Settings};
+use crate::body::{self, BodyFilter, BufFlags, Host, Parallel, Settings};
 use crate::content_type;
 use crate::encoder_pool;
 use crate::ratio;
@@ -49,6 +51,15 @@ const MAX_WINDOW_BITS: usize = Window::MAX_STANDARD_BITS as usize;
 
 const UNSET: isize = -1;
 const UNSET_SIZE: usize = usize::MAX;
+/// `NGX_CONF_UNSET_PTR`.
+const UNSET_PTR: *mut c_void = usize::MAX as *mut c_void;
+
+const MIN_SEGMENT_SIZE: usize = 64 << 10;
+const MAX_SEGMENT_SIZE: usize = 16 << 20;
+const MAX_PARALLEL_TASKS: ngx_int_t = 1024;
+
+#[cfg(ngx_feature = "threads")]
+mod threads;
 
 /// Location configuration. Field offsets are used by the stock NGINX slot
 /// setters, so the layout must stay `repr(C)`.
@@ -64,6 +75,10 @@ struct FilterConf {
     reuse_memory: ngx_flag_t,
     /// `None` until `brotli_retention_policy` is set or merged.
     retention: Option<RetentionPolicy>,
+    /// The `ngx_thread_pool_t` of `brotli_thread_pool`; null when it is off.
+    thread_pool: *mut c_void,
+    segment_size: usize,
+    parallel_tasks: ngx_int_t,
 }
 
 static mut COMP_LEVEL_BOUNDS: ngx_conf_num_bounds_t = ngx_conf_num_bounds_t {
@@ -76,9 +91,19 @@ static mut WINDOW_POST: ngx_conf_post_t = ngx_conf_post_t {
     post_handler: Some(parse_window_bits),
 };
 
+static mut SEGMENT_SIZE_POST: ngx_conf_post_t = ngx_conf_post_t {
+    post_handler: Some(check_segment_size),
+};
+
+static mut PARALLEL_TASKS_BOUNDS: ngx_conf_num_bounds_t = ngx_conf_num_bounds_t {
+    post_handler: Some(ngx_conf_check_num_bounds),
+    low: 1,
+    high: MAX_PARALLEL_TASKS,
+};
+
 const ANY_CONF: u32 = NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF;
 
-static mut COMMANDS: [ngx_command_t; 9] = [
+static mut COMMANDS: [ngx_command_t; 12] = [
     ngx_command_t {
         name: ngx_string!("brotli"),
         type_: (ANY_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG) as ngx_uint_t,
@@ -143,6 +168,30 @@ static mut COMMANDS: [ngx_command_t; 9] = [
         offset: 0,
         post: ptr::null_mut(),
     },
+    ngx_command_t {
+        name: ngx_string!("brotli_thread_pool"),
+        type_: (ANY_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_thread_pool),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("brotli_parallel_segment_size"),
+        type_: (ANY_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_conf_set_size_slot),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: core::mem::offset_of!(FilterConf, segment_size),
+        post: &raw mut SEGMENT_SIZE_POST as *mut c_void,
+    },
+    ngx_command_t {
+        name: ngx_string!("brotli_parallel_tasks"),
+        type_: (ANY_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_conf_set_num_slot),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: core::mem::offset_of!(FilterConf, parallel_tasks),
+        post: &raw mut PARALLEL_TASKS_BOUNDS as *mut c_void,
+    },
     ngx_command_t::empty(),
 ];
 
@@ -195,6 +244,7 @@ unsafe fn loc_conf<'a>(r: *mut ngx_http_request_t) -> &'a FilterConf {
 
 type FilterCtx = BodyFilter<NginxHost>;
 
+/// The filter state of `r`; null when its response is not compressed.
 unsafe fn request_ctx(r: *mut ngx_http_request_t) -> *mut FilterCtx {
     unsafe { (*(*r).ctx.add(module().ctx_index)).cast() }
 }
@@ -251,7 +301,11 @@ unsafe extern "C" fn header_filter(r: *mut ngx_http_request_t) -> ngx_int_t {
         }
     };
 
-    let ctx = BodyFilter::new(NginxHost { request: r }, settings);
+    let host = NginxHost {
+        request: r,
+        thread_pool: conf.thread_pool,
+    };
+    let ctx = BodyFilter::new(host, settings);
     let ctx = unsafe { Pool::from_ngx_pool(req.pool) }.allocate(ctx);
     if ctx.is_null() {
         return NGX_ERROR as ngx_int_t;
@@ -278,8 +332,18 @@ unsafe extern "C" fn header_filter(r: *mut ngx_http_request_t) -> ngx_int_t {
 unsafe extern "C" fn body_filter(r: *mut ngx_http_request_t, input: *mut ngx_chain_t) -> ngx_int_t {
     let ctx = unsafe { request_ctx(r) };
 
-    if ctx.is_null() || unsafe { (*ctx).is_done() } || unsafe { ngx_mbrotli_r_header_only(r) } != 0
-    {
+    if ctx.is_null() || unsafe { ngx_mbrotli_r_header_only(r) } != 0 {
+        return unsafe { next_body_filter(r, input) };
+    }
+
+    if unsafe { (*ctx).is_done() } {
+        // A complete response stays buffered until its last thread task is
+        // reported, and the writer calls the filters without input meanwhile.
+        // With nothing left to send, the write filter would fail that call
+        // ("the http output chain is empty").
+        if input.is_null() && unsafe { ngx_mbrotli_r_output_pending(r) } == 0 {
+            return NGX_OK as ngx_int_t;
+        }
         return unsafe { next_body_filter(r, input) };
     }
 
@@ -295,6 +359,8 @@ unsafe extern "C" fn body_filter(r: *mut ngx_http_request_t, input: *mut ngx_cha
 /// The NGINX side of [`Host`], for one request.
 struct NginxHost {
     request: *mut ngx_http_request_t,
+    /// The `ngx_thread_pool_t` segments are posted to, if any.
+    thread_pool: *mut c_void,
 }
 
 impl NginxHost {
@@ -367,6 +433,25 @@ impl Host for NginxHost {
         };
     }
 
+    fn post_task(&mut self, task: OwnedParallelTask) -> Option<OwnedParallelTask> {
+        if self.thread_pool.is_null() {
+            return Some(task);
+        }
+        #[cfg(ngx_feature = "threads")]
+        return unsafe { threads::post(self.request, self.thread_pool.cast(), task) };
+        #[cfg(not(ngx_feature = "threads"))]
+        Some(task)
+    }
+
+    fn set_blocked(&mut self, on: bool) {
+        #[cfg(ngx_feature = "threads")]
+        unsafe {
+            crate::bitfields::ngx_mbrotli_r_set_blocked(self.request, on as ngx_uint_t)
+        };
+        #[cfg(not(ngx_feature = "threads"))]
+        let _ = on;
+    }
+
     unsafe fn buf_flags(&self, b: *const ngx_buf_t) -> BufFlags {
         unsafe { buf_flags(b.cast_mut()) }
     }
@@ -404,9 +489,17 @@ fn settings(
     conf: &FilterConf,
     content_length: off_t,
     mode: CompressionMode,
-) -> Result<Settings, ConfigError> {
+) -> Result<Settings, Box<dyn core::error::Error>> {
     let quality = Quality::try_from(conf.quality as u8)?;
     let window = Window::standard(body::window_bits(content_length, conf.lg_win as u8))?;
+    let parallel = if conf.thread_pool.is_null() {
+        None
+    } else {
+        Some(Parallel {
+            segment_size: SegmentSize::try_from(conf.segment_size)?,
+            tasks: TaskCount::try_from(conf.parallel_tasks as usize)?,
+        })
+    };
 
     Ok(Settings {
         encoder: EncoderConfig::default()
@@ -422,6 +515,7 @@ fn settings(
         retention: conf.retention.unwrap_or(encoder_pool::DEFAULT_RETENTION),
         bufs_num: conf.bufs.num as usize,
         bufs_size: conf.bufs.size,
+        parallel,
     })
 }
 
@@ -439,6 +533,9 @@ unsafe extern "C" fn create_conf(cf: *mut ngx_conf_t) -> *mut c_void {
                 lg_win: UNSET_SIZE,
                 reuse_memory: UNSET,
                 retention: None,
+                thread_pool: UNSET_PTR,
+                segment_size: UNSET_SIZE,
+                parallel_tasks: UNSET,
             })
         };
     }
@@ -468,6 +565,19 @@ unsafe extern "C" fn merge_conf(
         .retention
         .or(prev.retention)
         .or(Some(encoder_pool::DEFAULT_RETENTION));
+    merge(
+        &mut conf.thread_pool,
+        prev.thread_pool,
+        UNSET_PTR,
+        ptr::null_mut(),
+    );
+    merge(
+        &mut conf.segment_size,
+        prev.segment_size,
+        UNSET_SIZE,
+        1 << 20,
+    );
+    merge(&mut conf.parallel_tasks, prev.parallel_tasks, UNSET, 4);
 
     if conf.bufs.num == 0 {
         conf.bufs = if prev.bufs.num != 0 {
@@ -564,6 +674,64 @@ unsafe extern "C" fn set_retention_policy(
 
     conf.retention = Some(policy);
     NGX_CONF_OK
+}
+
+/// `brotli_thread_pool off | <name>`.
+unsafe extern "C" fn set_thread_pool(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *conf.cast::<FilterConf>() };
+    if conf.thread_pool != UNSET_PTR {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+
+    let args: &mut [ngx_str_t] = unsafe { (*(*cf).args).as_slice_mut() };
+    let [_, name] = args else {
+        return NGX_CONF_ERROR;
+    };
+
+    if name.as_bytes() == b"off" {
+        conf.thread_pool = ptr::null_mut();
+        return NGX_CONF_OK;
+    }
+
+    #[cfg(ngx_feature = "threads")]
+    {
+        // The pool is looked up, or registered to be checked once the
+        // configuration has been read: `thread_pool` may come later.
+        let tp = unsafe { ngx::ffi::ngx_thread_pool_add(cf, name) };
+        if tp.is_null() {
+            return NGX_CONF_ERROR;
+        }
+        conf.thread_pool = tp.cast();
+        NGX_CONF_OK
+    }
+
+    #[cfg(not(ngx_feature = "threads"))]
+    {
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            cf,
+            "\"brotli_thread_pool\" requires NGINX built with --with-threads"
+        );
+        NGX_CONF_ERROR
+    }
+}
+
+/// Checks the bounds of `brotli_parallel_segment_size`.
+unsafe extern "C" fn check_segment_size(
+    _cf: *mut ngx_conf_t,
+    _post: *mut c_void,
+    data: *mut c_void,
+) -> *mut c_char {
+    let value = unsafe { *data.cast::<usize>() };
+    if (MIN_SEGMENT_SIZE..=MAX_SEGMENT_SIZE).contains(&value) {
+        NGX_CONF_OK
+    } else {
+        c"must be between 64k and 16m".as_ptr().cast_mut()
+    }
 }
 
 /// Translates `brotli_window` from a size into window bits.

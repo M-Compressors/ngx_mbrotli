@@ -40,6 +40,15 @@ jobs:
       - name: cargo clippy (without the ngx_modules export table)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
+      # `brotli_thread_pool` is compiled only for NGINX built with threads.
+      - name: Set up NGINX without threads
+        uses: ./.github/actions/setup-nginx
+        with:
+          threads: "false"
+          variant: no-threads
+      - name: cargo clippy (NGINX without threads)
+        run: cargo clippy --all-targets -- -D warnings
+
   test:
     name: test (nginx ${{ matrix.nginx }})
     runs-on: ubuntu-latest
