@@ -19,7 +19,7 @@ use Test::Nginx;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http/)->plan(25);
+my $t = Test::Nginx->new()->has(qw/http/)->plan(30);
 
 ###############################################################################
 
@@ -36,6 +36,7 @@ brotli_window 16m;
 brotli_min_length 256;
 brotli_reuse_memory off;
 brotli_retention_policy bounded 16m;
+brotli_idle_encoders 16;
 brotli_static always;
 EOF
 
@@ -47,12 +48,14 @@ like(check($t, 'brotli_retention_policy bounded 0;'), $ok, 'bounded 0');
 like(check($t, '', 'brotli_retention_policy release_all; brotli_reuse_memory on;'),
 	$ok, 'location level');
 
+like(check($t, 'brotli_idle_encoders 0;'), $ok, 'no idle encoders');
+
 like(check($t, 'brotli_thread_pool off; brotli_parallel_segment_size 256k; '
 		. 'brotli_parallel_tasks 8;'),
 	$ok, 'parallel directives');
 
 SKIP: {
-skip 'no threads', 3 unless $t->has_module('--with-threads');
+skip 'no threads', 4 unless $t->has_module('--with-threads');
 
 like(check($t, 'brotli_thread_pool brotli;', 'brotli_thread_pool off;',
 		'thread_pool brotli threads=2;'),
@@ -64,14 +67,20 @@ like(check($t, 'brotli_thread_pool nope;'),
 	qr/unknown thread pool "nope"/,
 	'unknown thread pool');
 
+like(check($t, 'brotli_parallel_compressors 16;'), $ok, 'parallel compressors');
+
 }
 
 SKIP: {
-skip 'threads', 1 if $t->has_module('--with-threads');
+skip 'threads', 2 if $t->has_module('--with-threads');
 
 like(check($t, 'brotli_thread_pool brotli;'),
 	qr/"brotli_thread_pool" requires NGINX built with --with-threads/,
 	'thread pool without threads');
+
+like(check($t, 'brotli_parallel_compressors 16;'),
+	qr/"brotli_parallel_compressors" requires NGINX built with --with-threads/,
+	'parallel compressors without threads');
 
 }
 
@@ -97,6 +106,14 @@ like(check($t, 'brotli_retention_policy release_all; '
 		. 'brotli_retention_policy aggressive;'),
 	qr/"brotli_retention_policy" directive is duplicate/,
 	'duplicate policy');
+
+like(check($t, '', 'brotli_idle_encoders 2;'),
+	qr/"brotli_idle_encoders" directive is not allowed here/,
+	'idle encoders in a location');
+
+like(check($t, 'brotli_idle_encoders 2000;'),
+	qr/value must be between 0 and 1024/,
+	'idle encoders bounds');
 
 like(check($t, 'brotli_reuse_memory maybe;'),
 	qr/invalid value "maybe" in "brotli_reuse_memory" directive/,

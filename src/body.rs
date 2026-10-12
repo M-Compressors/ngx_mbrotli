@@ -183,6 +183,8 @@ enum Session {
         session: ParallelEncoderSessionOwned,
         /// Segments the session has queued and the filter has not posted yet.
         queue: ParallelTaskQueue,
+        /// For a compressor from the cache, which takes it back.
+        lease: Option<encoder_pool::ParallelLease>,
     },
 }
 
@@ -392,9 +394,14 @@ impl<H: Host> BodyFilter<H> {
         }
         match session {
             Session::Serial(session) => encoder_pool::release(session.into_compressor()),
-            Session::Parallel { session, .. } => {
-                encoder_pool::release_parallel(session.into_compressor(), retention);
+            Session::Parallel {
+                session,
+                lease: Some(lease),
+                ..
+            } => {
+                encoder_pool::release_parallel(session.into_compressor(), retention, lease);
             }
+            Session::Parallel { lease: None, .. } => {}
         }
     }
 
@@ -504,14 +511,20 @@ impl<H: Host> BodyFilter<H> {
                 let config = ParallelConfig::from(segment_size).with_max_retained_workers(retained);
                 let compressor = if reuse_memory {
                     encoder_pool::acquire_parallel(encoder, config)
+                        .map(|(compressor, lease)| (compressor, Some(lease)))
                 } else {
                     encoder_pool::build_parallel(encoder, config)
+                        .map(|compressor| (compressor, None))
                 };
-                let compressor = compressor.map_err(|err| self.config_error(&err))?;
+                let (compressor, lease) = compressor.map_err(|err| self.config_error(&err))?;
                 let (session, queue) = compressor
                     .into_session(tasks)
                     .map_err(|err| self.encode_error(&err))?;
-                Session::Parallel { session, queue }
+                Session::Parallel {
+                    session,
+                    queue,
+                    lease,
+                }
             }
         };
         self.session = Some(session);

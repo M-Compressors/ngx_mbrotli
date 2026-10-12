@@ -3,21 +3,33 @@
 //! NGINX runs filters on a single thread per worker process, so a thread-local
 //! free list lets consecutive responses reuse an encoder's window, match finder
 //! and staging buffers instead of allocating them for every request
-//! (`brotli_reuse_memory`). How much an idle encoder keeps allocated is its
-//! retention policy (`brotli_retention_policy`).
+//! (`brotli_reuse_memory`). How many idle compressors a worker keeps is
+//! `brotli_idle_encoders`, and how much each keeps allocated is its retention
+//! policy (`brotli_retention_policy`).
 //!
 //! Parallel compressors (`brotli_thread_pool`) are kept in a list of their own:
-//! what they keep between responses is their idle segment workers.
+//! what they keep between responses is their idle segment workers. A response
+//! holds its compressor, workers included, until it has been sent, also while
+//! its segments wait for a thread; so the cache also counts the compressors
+//! with workers that responses hold, and keeps no more of them in all than
+//! `brotli_parallel_compressors` allows.
+//!
+//! Both limits are set once per worker process, by [`configure`].
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use mbrotli::compressor::parallel::{
     ParallelCompressor, ParallelConfig, ParallelConfigError, ParallelRetentionPolicy,
 };
 use mbrotli::{Compressor, ConfigError, EncoderConfig, RetentionPolicy};
 
-/// How many idle compressors a worker keeps.
-const MAX_IDLE: usize = 4;
+/// The default of `brotli_idle_encoders`: how many idle compressors a worker
+/// keeps, in each of its two caches.
+pub const DEFAULT_IDLE_ENCODERS: usize = 4;
+
+/// The default of `brotli_parallel_compressors`: how many parallel compressors
+/// keep workers, idle or held by a response.
+pub const DEFAULT_PARALLEL_COMPRESSORS: usize = 4;
 
 /// The default retention policy: idle compressors keep every buffer.
 ///
@@ -31,6 +43,23 @@ thread_local! {
 
     /// Idle parallel compressors, least recently released first.
     static IDLE_PARALLEL: RefCell<Vec<ParallelCompressor>> = const { RefCell::new(Vec::new()) };
+
+    /// Parallel compressors from the cache that keep workers, idle or held by
+    /// a response.
+    static PARALLEL_WITH_WORKERS: Cell<usize> = const { Cell::new(0) };
+
+    /// `brotli_idle_encoders`.
+    static IDLE_LIMIT: Cell<usize> = const { Cell::new(DEFAULT_IDLE_ENCODERS) };
+
+    /// `brotli_parallel_compressors`.
+    static PARALLEL_LIMIT: Cell<usize> = const { Cell::new(DEFAULT_PARALLEL_COMPRESSORS) };
+}
+
+/// Sets the cache limits of this thread (`brotli_idle_encoders` and
+/// `brotli_parallel_compressors`), before it compresses anything.
+pub fn configure(idle_encoders: usize, parallel_compressors: usize) {
+    IDLE_LIMIT.set(idle_encoders);
+    PARALLEL_LIMIT.set(parallel_compressors);
 }
 
 /// Builds a compressor that bypasses the cache.
@@ -83,12 +112,28 @@ pub fn build_parallel(
     ParallelCompressor::new(config, parallel)
 }
 
+/// A parallel compressor's place among those that keep workers
+/// ([`PARALLEL_WITH_WORKERS`]), given up when it is dropped.
+#[must_use]
+pub struct ParallelLease {
+    counted: bool,
+}
+
+impl Drop for ParallelLease {
+    fn drop(&mut self) {
+        if self.counted {
+            PARALLEL_WITH_WORKERS.set(PARALLEL_WITH_WORKERS.get() - 1);
+        }
+    }
+}
+
 /// Returns a parallel compressor for `config` and `parallel`, preferring an
-/// idle one: with the same encoder configuration, it keeps its workers.
+/// idle one: with the same encoder configuration, it keeps its workers. The
+/// lease goes back to [`release_parallel`] with it.
 pub fn acquire_parallel(
     config: EncoderConfig,
     parallel: ParallelConfig,
-) -> Result<ParallelCompressor, ParallelConfigError> {
+) -> Result<(ParallelCompressor, ParallelLease), ParallelConfigError> {
     let cached = IDLE_PARALLEL.with_borrow_mut(|idle| {
         let index = idle
             .iter()
@@ -97,34 +142,83 @@ pub fn acquire_parallel(
         Some(idle.remove(index))
     });
 
-    match cached {
-        Some(mut compressor) => {
-            if *compressor.encoder_config() != config {
-                compressor.reconfigure(config)?;
-            }
-            if *compressor.parallel_config() != parallel {
-                compressor.reconfigure_parallel(parallel);
-            }
-            Ok(compressor)
-        }
-        None => build_parallel(config, parallel),
+    let Some(mut compressor) = cached else {
+        let compressor = build_parallel(config, parallel)?;
+        return Ok((compressor, ParallelLease { counted: false }));
+    };
+    // An idle compressor with workers is counted already.
+    let lease = ParallelLease {
+        counted: compressor.retained_worker_count() > 0,
+    };
+    if *compressor.encoder_config() != config {
+        compressor.reconfigure(config)?;
     }
+    if *compressor.parallel_config() != parallel {
+        compressor.reconfigure_parallel(parallel);
+    }
+    Ok((compressor, lease))
 }
 
 /// Returns `compressor` to the cache, keeping as much of its workers'
-/// memory as `retention` allows.
-pub fn release_parallel(mut compressor: ParallelCompressor, retention: RetentionPolicy) {
+/// memory as `retention` allows, unless as many other compressors keep workers
+/// as `brotli_parallel_compressors` allows.
+pub fn release_parallel(
+    mut compressor: ParallelCompressor,
+    retention: RetentionPolicy,
+    mut lease: ParallelLease,
+) {
     compressor.trim(match retention {
         RetentionPolicy::Aggressive => ParallelRetentionPolicy::Aggressive,
         RetentionPolicy::CurrentConfig => ParallelRetentionPolicy::CurrentPlan,
         RetentionPolicy::Bounded { max_bytes } => ParallelRetentionPolicy::Bounded { max_bytes },
         RetentionPolicy::ReleaseAll => ParallelRetentionPolicy::ReleaseAll,
     });
-    IDLE_PARALLEL.with_borrow_mut(|idle| push_idle(idle, compressor));
+
+    let keeps = compressor.retained_worker_count() > 0;
+    match (lease.counted, keeps) {
+        // Still counted; it moves to the cache below.
+        (true, true) => lease.counted = false,
+        (true, false) => {}
+        (false, true) if PARALLEL_WITH_WORKERS.get() < PARALLEL_LIMIT.get() => {
+            PARALLEL_WITH_WORKERS.set(PARALLEL_WITH_WORKERS.get() + 1);
+        }
+        (false, true) => compressor.trim(ParallelRetentionPolicy::ReleaseAll),
+        (false, false) => {}
+    }
+    drop(lease);
+
+    let counted = |c: &ParallelCompressor| c.retained_worker_count() > 0;
+    let limit = IDLE_LIMIT.get();
+    if limit == 0 {
+        if counted(&compressor) {
+            PARALLEL_WITH_WORKERS.set(PARALLEL_WITH_WORKERS.get() - 1);
+        }
+        return;
+    }
+
+    IDLE_PARALLEL.with_borrow_mut(|idle| {
+        if idle.len() >= limit {
+            // Compressors without workers are cheap to build again: they go
+            // first, and one is not kept in place of one with workers.
+            let evicted = match idle.iter().position(|c| !counted(c)) {
+                Some(index) => idle.remove(index),
+                None if !counted(&compressor) => return,
+                None => idle.remove(0),
+            };
+            if counted(&evicted) {
+                PARALLEL_WITH_WORKERS.set(PARALLEL_WITH_WORKERS.get() - 1);
+            }
+        }
+        idle.push(compressor);
+    });
 }
 
 fn push_idle<T>(idle: &mut Vec<T>, compressor: T) {
-    if idle.len() >= MAX_IDLE {
+    let limit = IDLE_LIMIT.get();
+    if limit == 0 {
+        return;
+    }
+    if idle.len() >= limit {
         idle.remove(0);
     }
     idle.push(compressor);
@@ -132,9 +226,16 @@ fn push_idle<T>(idle: &mut Vec<T>, compressor: T) {
 
 #[cfg(test)]
 mod tests {
+    use mbrotli::compressor::parallel::{
+        ParallelCompressor, ParallelConfig, ParallelEncoderStatus, SegmentSize, TaskCount,
+    };
     use mbrotli::{EncoderConfig, Operation, Quality, RetentionPolicy, Window};
 
-    use super::{DEFAULT_RETENTION, IDLE, MAX_IDLE, acquire, release};
+    use super::{
+        DEFAULT_IDLE_ENCODERS as MAX_IDLE, DEFAULT_RETENTION, IDLE, IDLE_PARALLEL,
+        PARALLEL_WITH_WORKERS, ParallelLease, acquire, acquire_parallel, configure, release,
+        release_parallel,
+    };
 
     fn config(quality: Quality, bits: u8) -> EncoderConfig {
         EncoderConfig::default()
@@ -208,5 +309,96 @@ mod tests {
         held.into_iter().for_each(release);
 
         assert_eq!(idle_policies(), [RetentionPolicy::Aggressive; MAX_IDLE]);
+    }
+
+    /// Takes a parallel compressor from the cache and compresses with it, so
+    /// that it has a worker.
+    fn busy_parallel(config: EncoderConfig) -> (ParallelCompressor, ParallelLease) {
+        let parallel = ParallelConfig::from(SegmentSize::try_from(64 << 10).unwrap())
+            .with_max_retained_workers(2);
+        let (compressor, lease) = acquire_parallel(config, parallel).unwrap();
+        let (mut session, queue) = compressor.into_session(TaskCount::ONE).unwrap();
+        let input = b"parallel parallel parallel".repeat(100);
+        let mut out = vec![0; 1 << 16];
+        let mut op = Operation::Finish;
+        let mut input: &[u8] = &input;
+        loop {
+            let progress = session.process(input, &mut out, op).unwrap();
+            input = &input[progress.consumed..];
+            while let Some(task) = queue.try_recv() {
+                task.run();
+            }
+            if progress.status == ParallelEncoderStatus::Finished {
+                break;
+            }
+            op = Operation::Finish;
+        }
+        let compressor = session.into_compressor();
+        assert!(compressor.retained_worker_count() > 0);
+        (compressor, lease)
+    }
+
+    fn parallel_with_workers() -> (usize, usize) {
+        let idle = IDLE_PARALLEL.with_borrow(|idle| {
+            idle.iter()
+                .filter(|c| c.retained_worker_count() > 0)
+                .count()
+        });
+        (PARALLEL_WITH_WORKERS.get(), idle)
+    }
+
+    #[test]
+    fn workers_are_kept_for_a_bounded_number_of_parallel_compressors() {
+        let q5 = config(Quality::Q5, 16);
+        let held: Vec<_> = (0..MAX_IDLE + 2).map(|_| busy_parallel(q5)).collect();
+        for (compressor, lease) in held {
+            release_parallel(compressor, RetentionPolicy::Aggressive, lease);
+        }
+        assert_eq!(parallel_with_workers(), (MAX_IDLE, MAX_IDLE));
+
+        // Taken again, they are still counted; dropped, they are not.
+        let mut held: Vec<_> = (0..MAX_IDLE + 2).map(|_| busy_parallel(q5)).collect();
+        assert_eq!(parallel_with_workers(), (MAX_IDLE, 0));
+        for (compressor, lease) in held.drain(..2) {
+            release_parallel(compressor, RetentionPolicy::ReleaseAll, lease);
+        }
+        assert_eq!(parallel_with_workers(), (MAX_IDLE - 2, 0));
+        drop(busy_parallel(q5));
+        assert_eq!(parallel_with_workers(), (MAX_IDLE - 2, 0));
+        drop(held);
+        assert_eq!(parallel_with_workers(), (0, 0));
+    }
+
+    #[test]
+    fn the_limits_are_configurable() {
+        let q1 = config(Quality::Q1, 16);
+        let q5 = config(Quality::Q5, 16);
+
+        configure(2, 1);
+        let held: Vec<_> = (0..5)
+            .map(|_| acquire(q1, DEFAULT_RETENTION).unwrap())
+            .collect();
+        held.into_iter().for_each(release);
+        assert_eq!(idle_policies().len(), 2);
+
+        let held: Vec<_> = (0..3).map(|_| busy_parallel(q5)).collect();
+        for (compressor, lease) in held {
+            release_parallel(compressor, RetentionPolicy::Aggressive, lease);
+        }
+        assert_eq!(parallel_with_workers(), (1, 1));
+        assert_eq!(IDLE_PARALLEL.with_borrow(Vec::len), 2);
+
+        // Nothing is kept, and nothing stays counted.
+        configure(0, 1);
+        let (compressor, lease) = busy_parallel(q5);
+        release_parallel(compressor, RetentionPolicy::Aggressive, lease);
+        release(acquire(q1, DEFAULT_RETENTION).unwrap());
+        assert_eq!(idle_policies().len(), 1);
+        assert_eq!(parallel_with_workers(), (1, 1));
+        IDLE_PARALLEL.with_borrow_mut(Vec::clear);
+        PARALLEL_WITH_WORKERS.set(0);
+        let (compressor, lease) = busy_parallel(q5);
+        release_parallel(compressor, RetentionPolicy::Aggressive, lease);
+        assert_eq!(parallel_with_workers(), (0, 0));
     }
 }

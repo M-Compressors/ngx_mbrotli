@@ -15,18 +15,19 @@ use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, Pool};
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12, NGX_ERROR,
     NGX_HTTP_FORBIDDEN, NGX_HTTP_GZIP_BUFFERED, NGX_HTTP_LIF_CONF, NGX_HTTP_LOC_CONF,
-    NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MODULE, NGX_HTTP_NOT_FOUND, NGX_HTTP_OK,
-    NGX_HTTP_SRV_CONF, NGX_LOG_ALERT, NGX_LOG_EMERG, NGX_OK, ngx_alloc_chain_link, ngx_array_t,
-    ngx_buf_t, ngx_bufs_t, ngx_chain_add_copy, ngx_chain_t, ngx_chain_update_chains, ngx_command_t,
-    ngx_conf_check_num_bounds, ngx_conf_num_bounds_t, ngx_conf_post_t, ngx_conf_set_bufs_slot,
-    ngx_conf_set_flag_slot, ngx_conf_set_num_slot, ngx_conf_set_size_slot, ngx_conf_t,
-    ngx_create_temp_buf, ngx_flag_t, ngx_hash_t, ngx_http_add_variable,
-    ngx_http_html_default_types, ngx_http_merge_types, ngx_http_module_t,
-    ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
-    ngx_http_test_content_type, ngx_http_top_body_filter, ngx_http_top_header_filter,
-    ngx_http_types_slot, ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_log_t,
-    ngx_module_t, ngx_pagesize, ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t,
-    ngx_str_t, ngx_table_elt_t, ngx_uint_t, off_t,
+    NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE,
+    NGX_HTTP_NOT_FOUND, NGX_HTTP_OK, NGX_HTTP_SRV_CONF, NGX_LOG_ALERT, NGX_LOG_EMERG, NGX_OK,
+    ngx_alloc_chain_link, ngx_array_t, ngx_buf_t, ngx_bufs_t, ngx_chain_add_copy, ngx_chain_t,
+    ngx_chain_update_chains, ngx_command_t, ngx_conf_check_num_bounds, ngx_conf_num_bounds_t,
+    ngx_conf_post_t, ngx_conf_set_bufs_slot, ngx_conf_set_flag_slot, ngx_conf_set_num_slot,
+    ngx_conf_set_size_slot, ngx_conf_t, ngx_create_temp_buf, ngx_cycle_t, ngx_flag_t, ngx_hash_t,
+    ngx_http_add_variable, ngx_http_conf_ctx_t, ngx_http_html_default_types, ngx_http_merge_types,
+    ngx_http_module, ngx_http_module_t, ngx_http_output_body_filter_pt,
+    ngx_http_output_header_filter_pt, ngx_http_request_t, ngx_http_test_content_type,
+    ngx_http_top_body_filter, ngx_http_top_header_filter, ngx_http_types_slot,
+    ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_log_t, ngx_module_t, ngx_pagesize,
+    ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t, ngx_str_t, ngx_table_elt_t,
+    ngx_uint_t, off_t,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug_mask, ngx_log_error, ngx_string};
 
@@ -57,9 +58,19 @@ const UNSET_PTR: *mut c_void = usize::MAX as *mut c_void;
 const MIN_SEGMENT_SIZE: usize = 64 << 10;
 const MAX_SEGMENT_SIZE: usize = 16 << 20;
 const MAX_PARALLEL_TASKS: ngx_int_t = 1024;
+const MAX_CACHED: ngx_int_t = 1024;
 
 #[cfg(ngx_feature = "threads")]
 mod threads;
+
+/// Main configuration: the limits of each worker's encoder caches.
+#[repr(C)]
+struct FilterMainConf {
+    /// `brotli_idle_encoders`.
+    idle_encoders: ngx_int_t,
+    /// `brotli_parallel_compressors`.
+    parallel_compressors: ngx_int_t,
+}
 
 /// Location configuration. Field offsets are used by the stock NGINX slot
 /// setters, so the layout must stay `repr(C)`.
@@ -95,6 +106,12 @@ static mut SEGMENT_SIZE_POST: ngx_conf_post_t = ngx_conf_post_t {
     post_handler: Some(check_segment_size),
 };
 
+static mut CACHED_BOUNDS: ngx_conf_num_bounds_t = ngx_conf_num_bounds_t {
+    post_handler: Some(ngx_conf_check_num_bounds),
+    low: 0,
+    high: MAX_CACHED,
+};
+
 static mut PARALLEL_TASKS_BOUNDS: ngx_conf_num_bounds_t = ngx_conf_num_bounds_t {
     post_handler: Some(ngx_conf_check_num_bounds),
     low: 1,
@@ -103,7 +120,7 @@ static mut PARALLEL_TASKS_BOUNDS: ngx_conf_num_bounds_t = ngx_conf_num_bounds_t 
 
 const ANY_CONF: u32 = NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF;
 
-static mut COMMANDS: [ngx_command_t; 12] = [
+static mut COMMANDS: [ngx_command_t; 14] = [
     ngx_command_t {
         name: ngx_string!("brotli"),
         type_: (ANY_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG) as ngx_uint_t,
@@ -192,14 +209,30 @@ static mut COMMANDS: [ngx_command_t; 12] = [
         offset: core::mem::offset_of!(FilterConf, parallel_tasks),
         post: &raw mut PARALLEL_TASKS_BOUNDS as *mut c_void,
     },
+    ngx_command_t {
+        name: ngx_string!("brotli_idle_encoders"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_conf_set_num_slot),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: core::mem::offset_of!(FilterMainConf, idle_encoders),
+        post: &raw mut CACHED_BOUNDS as *mut c_void,
+    },
+    ngx_command_t {
+        name: ngx_string!("brotli_parallel_compressors"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_parallel_compressors),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: core::mem::offset_of!(FilterMainConf, parallel_compressors),
+        post: &raw mut CACHED_BOUNDS as *mut c_void,
+    },
     ngx_command_t::empty(),
 ];
 
 static MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
     preconfiguration: Some(add_variables),
     postconfiguration: Some(filter_init),
-    create_main_conf: None,
-    init_main_conf: None,
+    create_main_conf: Some(create_main_conf),
+    init_main_conf: Some(init_main_conf),
     create_srv_conf: None,
     merge_srv_conf: None,
     create_loc_conf: Some(create_conf),
@@ -213,6 +246,7 @@ pub static mut ngx_http_brotli_filter_module: ngx_module_t = ngx_module_t {
     ctx: &raw const MODULE_CTX as _,
     commands: unsafe { &raw mut COMMANDS[0] },
     type_: NGX_HTTP_MODULE as _,
+    init_process: Some(init_process),
     ..ngx_module_t::default()
 };
 
@@ -519,6 +553,49 @@ fn settings(
     })
 }
 
+unsafe extern "C" fn create_main_conf(cf: *mut ngx_conf_t) -> *mut c_void {
+    let conf: *mut FilterMainConf =
+        unsafe { ngx_palloc((*cf).pool, size_of::<FilterMainConf>()) }.cast();
+    if !conf.is_null() {
+        unsafe {
+            conf.write(FilterMainConf {
+                idle_encoders: UNSET,
+                parallel_compressors: UNSET,
+            })
+        };
+    }
+    conf.cast()
+}
+
+unsafe extern "C" fn init_main_conf(_cf: *mut ngx_conf_t, conf: *mut c_void) -> *mut c_char {
+    let conf = unsafe { &mut *conf.cast::<FilterMainConf>() };
+    if conf.idle_encoders == UNSET {
+        conf.idle_encoders = encoder_pool::DEFAULT_IDLE_ENCODERS as ngx_int_t;
+    }
+    if conf.parallel_compressors == UNSET {
+        conf.parallel_compressors = encoder_pool::DEFAULT_PARALLEL_COMPRESSORS as ngx_int_t;
+    }
+    NGX_CONF_OK
+}
+
+/// Sets this worker's cache limits from the `http` block, if there is one.
+unsafe extern "C" fn init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
+    let http = unsafe {
+        *(*cycle)
+            .conf_ctx
+            .add((*ptr::addr_of!(ngx_http_module)).index)
+    };
+    let Some(http) = (unsafe { http.cast::<ngx_http_conf_ctx_t>().as_ref() }) else {
+        return NGX_OK as ngx_int_t;
+    };
+    let conf = unsafe { &*(*http.main_conf.add(module().ctx_index)).cast::<FilterMainConf>() };
+    encoder_pool::configure(
+        conf.idle_encoders as usize,
+        conf.parallel_compressors as usize,
+    );
+    NGX_OK as ngx_int_t
+}
+
 unsafe extern "C" fn create_conf(cf: *mut ngx_conf_t) -> *mut c_void {
     let conf: *mut FilterConf = unsafe { ngx_palloc((*cf).pool, size_of::<FilterConf>()) }.cast();
     if !conf.is_null() {
@@ -715,6 +792,29 @@ unsafe extern "C" fn set_thread_pool(
             NGX_LOG_EMERG,
             cf,
             "\"brotli_thread_pool\" requires NGINX built with --with-threads"
+        );
+        NGX_CONF_ERROR
+    }
+}
+
+/// `brotli_parallel_compressors <number>`, which only NGINX with threads uses.
+unsafe extern "C" fn set_parallel_compressors(
+    cf: *mut ngx_conf_t,
+    cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    #[cfg(ngx_feature = "threads")]
+    {
+        unsafe { ngx_conf_set_num_slot(cf, cmd, conf) }
+    }
+
+    #[cfg(not(ngx_feature = "threads"))]
+    {
+        let _ = (cmd, conf);
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            cf,
+            "\"brotli_parallel_compressors\" requires NGINX built with --with-threads"
         );
         NGX_CONF_ERROR
     }

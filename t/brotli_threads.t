@@ -23,7 +23,7 @@ select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
 my $t = Test::Nginx->new()->has(qw/http proxy ssi --with-threads/)
-	->has_daemon('brotli')->plan(23)
+	->has_daemon('brotli')->plan(27)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -44,6 +44,10 @@ http {
     }
 
     log_format ratio '$uri $brotli_ratio';
+
+    # Fewer cached compressors than responses in the tests below.
+    brotli_idle_encoders 2;
+    brotli_parallel_compressors 1;
 
     server {
         listen       127.0.0.1:8080;
@@ -74,6 +78,16 @@ http {
         location /noreuse/ {
             alias %%TESTDIR%%/;
             brotli_reuse_memory off;
+        }
+
+        location /release/ {
+            alias %%TESTDIR%%/;
+            brotli_retention_policy release_all;
+        }
+
+        location /bounded/ {
+            alias %%TESTDIR%%/;
+            brotli_retention_policy bounded 64k;
         }
 
         location /small_buffers/ {
@@ -167,6 +181,18 @@ is(br_body($r), $html, 'default thread pool');
 for my $n (1, 2) {
 	$r = get('/noreuse/index.html', 'br');
 	is(br_body($r), $html, "no reuse $n");
+}
+
+# Idle compressors keep no segment encoders, or only small ones.
+
+for my $n (1, 2) {
+	$r = get('/release/index.html', 'br');
+	is(br_body($r), $html, "release_all retention $n");
+}
+
+for my $n (1, 2) {
+	$r = get('/bounded/index.html', 'br');
+	is(br_body($r), $html, "bounded retention $n");
 }
 
 $r = get('/small_buffers/index.html', 'br');
