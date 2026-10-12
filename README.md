@@ -13,6 +13,74 @@ keep working unchanged.
 
 Both modules are built into one dynamic library, so one `load_module` line loads both.
 
+## Installing
+
+On Linux with nginx from nginx.org or from Debian, Ubuntu, RHEL (and AlmaLinux,
+Rocky Linux), Fedora, Amazon Linux or Alpine:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/M-Compressors/ngx_mbrotli/main/install.sh | sh
+```
+
+The script picks the [prebuilt module](#prebuilt-modules) of the latest release
+for the installed nginx and checks it against the release's `SHA256SUMS` and
+nginx's module signature. It then copies the module into nginx's modules
+directory and loads it. Where nginx.conf includes a directory of module
+configurations (Debian, Ubuntu, RHEL, Fedora, Alpine), the script adds
+`mod-mbrotli.conf` there. Otherwise it adds `load_module` as the first line of
+nginx.conf and saves the previous version as `nginx.conf.before-mbrotli`. If
+`nginx -t` fails, the change is undone. Reload nginx afterwards.
+
+Run the script again after every nginx upgrade: nginx does not start with a
+module built for another version. If the machine already loads google/ngx_brotli,
+the script stops; ngx_mbrotli replaces it, so remove it first.
+
+Set `NGX_MBROTLI_VERSION=v0.3.0` to install a given release, or
+`NGX_MBROTLI_NO_CONFIG=1` to only copy the module. The script needs `sh`, `curl`
+or `wget`, and `sha256sum` or `shasum`. Missing `tar`, `gzip` or `libgcc`
+(Alpine) are installed with the system's package manager, using `sudo` when not
+run as root.
+
+## Prebuilt modules
+
+Every [release](https://github.com/M-Compressors/ngx_mbrotli/releases) has
+modules built for the NGINX packages of nginx.org and the major Linux
+distributions, for x86_64 and aarch64. NGINX loads a module only if it was
+built for exactly the same version, so pick the archive by `nginx -v`:
+
+| NGINX | Archive (`ngx_mbrotli-<release>-…`) |
+|---|---|
+| nginx.org packages and the `nginx` Docker images; Debian 13; Ubuntu 24.04 and 26.04; RHEL, AlmaLinux and Rocky Linux 8–10; Fedora; Amazon Linux 2023 | `nginx<version>-<arch>-linux-gnu.tar.gz` |
+| `nginx:*-alpine` Docker images | `nginx<version>-<arch>-linux-musl.tar.gz` |
+| Alpine 3.21–3.24 (`apk add nginx`) | `nginx<version>-alpine<release>-<arch>-linux-musl.tar.gz` |
+
+Modules are built for NGINX 1.24.0, 1.26.3, 1.28.3, 1.30.5 and 1.31.6, and for
+the nginx that each Alpine release ships. The glibc builds need glibc 2.28 or
+newer. The Alpine builds need `libgcc`, which the `nginx` Docker images already
+include (`apk add libgcc` on plain Alpine). NGINX older than 1.23 (Debian 12,
+Ubuntu 22.04, RHEL 9's default stream) is not supported.
+
+```sh
+nginx -v    # nginx version: nginx/1.26.3
+curl -fsSLO https://github.com/M-Compressors/ngx_mbrotli/releases/download/v0.3.0/ngx_mbrotli-0.3.0-nginx1.26.3-x86_64-linux-gnu.tar.gz
+tar -xzf ngx_mbrotli-0.3.0-nginx1.26.3-x86_64-linux-gnu.tar.gz
+sudo cp ngx_mbrotli-0.3.0-nginx1.26.3-x86_64-linux-gnu/ngx_mbrotli.so /usr/lib/nginx/modules/
+```
+
+Then load it at the top of `nginx.conf`:
+`load_module /usr/lib/nginx/modules/ngx_mbrotli.so;`. RHEL, Fedora and Amazon
+Linux keep modules in `/usr/lib64/nginx/modules` instead.
+
+If NGINX reports that the module "is not binary compatible", the nginx binary
+was configured differently from the build. `BUILDINFO` in the archive lists the
+version, signature and `configure` arguments of the build; compare the signature
+with the binary's
+(`grep -ao '[0-9],[0-9],[0-9],[01]\{30,\}' "$(command -v nginx)"`) or build the
+module yourself as described below.
+
+Each build is tested by loading it into its distribution's own nginx and serving
+compressed and pre-compressed responses (`.github/workflows/binaries.yml`).
+
 ## Building
 
 Requirements:
@@ -393,6 +461,14 @@ collects the pending changesets into a **Release (main)** pull request that bump
 the version in `Cargo.toml` and updates `CHANGELOG.md`. Merging that pull request
 tags the release (`vX.Y.Z`) and publishes a GitHub Release with the changelog
 entry. The crate is not published to crates.io.
+
+The binaries workflow (`.github/workflows/binaries.yml`) then builds the
+[prebuilt modules](#prebuilt-modules), tests each one in the distributions'
+own nginx and attaches them to the release. NGINX versions are listed in its
+build matrix. When a distribution moves to a new NGINX version, the test for it
+warns that no module was built for that version. Add the version to the matrix
+and run the workflow by hand with the release's tag (*Actions → Binaries → Run
+workflow*) to add the module to an existing release.
 
 For the workflow to open pull requests, enable *Settings → Actions → General →
 Allow GitHub Actions to create and approve pull requests*.

@@ -2,7 +2,8 @@ name: Release
 
 # Sampo turns pending changesets (.sampo/changesets/*.md) into a "Release (main)"
 # pull request that bumps the version and updates CHANGELOG.md. Merging that pull
-# request tags the release and creates a GitHub Release from the changelog.
+# request tags the release and creates a GitHub Release from the changelog, to
+# which binaries.yml then attaches the prebuilt modules.
 
 on:
   push:
@@ -22,6 +23,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,3 +40,16 @@ jobs:
           create-github-release: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release tag
+        id: tag
+        if: steps.sampo.outputs.published == 'true'
+        run: echo "tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
+  # A release made with GITHUB_TOKEN does not trigger other workflows, so the
+  # binaries are built from here.
+  binaries:
+    needs: release
+    if: needs.release.outputs.tag
+    uses: ./.github/workflows/binaries.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}

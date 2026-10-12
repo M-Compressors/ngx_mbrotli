@@ -6,10 +6,16 @@
 //! <https://github.com/rust-lang/cargo/issues/3544>.
 
 use std::env;
+use std::path::Path;
 
 fn main() {
     println!("cargo::rerun-if-changed=src/bitfields.c");
     println!("cargo::rerun-if-env-changed=DEP_NGINX_INCLUDE");
+    // Re-running `configure` changes the layout without changing the paths.
+    if let Some(dir) = env::var_os("DEP_NGINX_BUILD_DIR") {
+        let config = Path::new(&dir).join("ngx_auto_config.h");
+        println!("cargo::rerun-if-changed={}", config.display());
+    }
 
     let includes = env::var_os("DEP_NGINX_INCLUDE").expect("nginx-sys exports DEP_NGINX_INCLUDE");
 
