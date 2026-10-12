@@ -21,8 +21,11 @@ up the worker's event loop. NGINX must be built with `--with-threads`:
 ```nginx
 load_module /path/to/libngx_mbrotli.so;
 
-# Each worker process gets its own 4 threads.
-thread_pool brotli threads=4;
+# The pool named `default` exists without being declared: 32 threads per worker
+# process, shared with `aio threads`. To size compression on its own, declare
+# a pool of its own and name it in `brotli_thread_pool`:
+#
+#     thread_pool brotli threads=4;
 
 http {
     brotli on;
@@ -33,7 +36,7 @@ http {
 
     # Responses are cut into 1m segments; up to 4 of them per response are
     # compressed at once on the pool's threads.
-    brotli_thread_pool brotli;
+    brotli_thread_pool default;
     brotli_parallel_segment_size 1m;
     brotli_parallel_tasks 4;
 
