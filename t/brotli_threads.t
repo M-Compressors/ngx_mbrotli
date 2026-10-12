@@ -108,6 +108,7 @@ http {
             proxy_pass http://127.0.0.1:8081/;
             proxy_buffering off;
             proxy_buffer_size 16k;
+            proxy_buffers 4 16k;
         }
 
         location /ssi/ {
