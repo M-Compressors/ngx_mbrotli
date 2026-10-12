@@ -1,5 +1,16 @@
 # ngx_mbrotli
 
+## 0.3.0 — 2026-10-11
+
+### Minor changes
+
+- [1dd6380](https://github.com/M-Compressors/ngx_mbrotli/commit/1dd6380c57fce0546b311e8d4c7a363879c49d4d) Compress uncompressed TrueType and OpenType fonts (`font/ttf`, `font/otf`, `application/vnd.ms-fontobject` and similar types) in Brotli's font mode, which makes them about 0.1–0.3% smaller. Other responses, including WOFF and WOFF2 fonts, are still compressed in generic mode. — Thanks @Mnwa!
+- [60afc80](https://github.com/M-Compressors/ngx_mbrotli/commit/60afc801b58c7b7ab864de9970389a07922aaf2a) `brotli_retention_policy` now defaults to `aggressive`: an idle encoder keeps all of its working memory, so a worker allocates only what its largest responses grew into. Set `brotli_retention_policy bounded 8m` for the previous default. — Thanks @Mnwa!
+
+### Patch changes
+
+- [60afc80](https://github.com/M-Compressors/ngx_mbrotli/commit/60afc801b58c7b7ab864de9970389a07922aaf2a) Update mbrotli to 0.5.9, which makes `brotli_comp_level 4` 1–2% faster on 2 KB–1 MB responses. Output is unchanged. — Thanks @Mnwa!
+
 ## 0.2.0 — 2026-10-10
 
 ### Minor changes
