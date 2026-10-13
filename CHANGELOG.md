@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.1 — 2026-10-13
+
+### Patch changes
+
+- [eed3503](https://github.com/M-Compressors/ngx_mbrotli/commit/eed350374d52a3e2d25d924aadadcf0b20b4aa6b) Update mbrotli to 0.5.11. With `brotli_thread_pool`, the encoder now writes straight into uninitialized output buffers, as it already did without a thread pool, so each new `brotli_buffers` buffer is no longer zeroed first. Output is unchanged. — Thanks @Mnwa!
+
 ## 0.4.0 — 2026-10-12
 
 ### Minor changes
