@@ -638,11 +638,6 @@ impl<H: Host> BodyFilter<H> {
         if b.is_null() {
             return Err(Failed);
         }
-        if self.settings.parallel.is_some() {
-            // A parallel session writes into initialized memory only. The
-            // buffer is recycled, so it is cleared just this once.
-            unsafe { ptr::write_bytes((*b).start, 0, size) };
-        }
         self.out_buf = b;
         self.bufs += 1;
 
@@ -659,24 +654,17 @@ impl<H: Host> BodyFilter<H> {
         let room = room as usize;
         self.collect = false;
 
+        // Buffer memory is uninitialized until the encoder writes it.
+        let output = unsafe { slice::from_raw_parts_mut(last.cast::<MaybeUninit<u8>>(), room) };
         let outcome = match self.session.as_mut().ok_or(Failed)? {
-            Session::Serial(session) => {
-                // Buffer memory is uninitialized until the encoder writes it.
-                let output =
-                    unsafe { slice::from_raw_parts_mut(last.cast::<MaybeUninit<u8>>(), room) };
-                session
-                    .process_uninit(input, output, self.operation)
-                    .map(Outcome::from)
-                    .map_err(|err| err.to_string())
-            }
-            Session::Parallel { session, .. } => {
-                // Output buffers are cleared when they are created (get_buf).
-                let output = unsafe { slice::from_raw_parts_mut(last, room) };
-                session
-                    .process(input, output, self.operation)
-                    .map(Outcome::from)
-                    .map_err(|err| err.to_string())
-            }
+            Session::Serial(session) => session
+                .process_uninit(input, output, self.operation)
+                .map(Outcome::from)
+                .map_err(|err| err.to_string()),
+            Session::Parallel { session, .. } => session
+                .process_uninit(input, output, self.operation)
+                .map(Outcome::from)
+                .map_err(|err| err.to_string()),
         };
         let progress = outcome.map_err(|err| self.encode_error(&err))?;
 

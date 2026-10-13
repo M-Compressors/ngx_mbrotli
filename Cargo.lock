@@ -277,9 +277,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mbrotli"
-version = "0.5.10"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68c922f521ac929d2c1ade48c5770855c0c0de475357538d3f5e2fb08dfe2a5d"
+checksum = "d4e58730cdbe70e598298852ace7216ad56665d45618da0f672de82aa71f6f5d"
 dependencies = [
  "borrowed-buf",
  "fearless_simd",
