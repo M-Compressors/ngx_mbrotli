@@ -58,13 +58,24 @@ mod exports {
         ptr::null(),
     ];
 
-    /// Same order as google/ngx_brotli's `config`: the filter is inserted
-    /// before the first of the listed modules that is present, i.e. right
-    /// after the gzip filter.
+    /// NGINX inserts each module before the earliest loaded module listed
+    /// after its own name, up to the terminating null, so the static module's
+    /// entries come first and the filter does not see them.
+    ///
+    /// Content phase handlers and header filters run in reverse module order,
+    /// so both modules go before their zstd-nginx-module counterparts: when a
+    /// client accepts both encodings, zstd is chosen for `.zst` files and for
+    /// compression on the fly. Without zstd the static module lands before the
+    /// filter, which only filters follow, as if appended, and the filter takes
+    /// the same order as in google/ngx_brotli's `config`: right after the gzip
+    /// filter.
     #[unsafe(no_mangle)]
     #[allow(non_upper_case_globals)]
-    pub static mut ngx_module_order: [*const c_char; 17] = [
+    pub static mut ngx_module_order: [*const c_char; 20] = [
+        c"ngx_http_brotli_static_module".as_ptr(),
+        c"ngx_http_zstd_static_module".as_ptr(),
         c"ngx_http_brotli_filter_module".as_ptr(),
+        c"ngx_http_zstd_filter_module".as_ptr(),
         c"ngx_pagespeed".as_ptr(),
         c"ngx_http_postpone_filter_module".as_ptr(),
         c"ngx_http_ssi_filter_module".as_ptr(),
