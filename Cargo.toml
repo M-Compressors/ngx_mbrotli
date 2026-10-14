@@ -14,14 +14,14 @@ keywords = ["mbrotli", "brotli", "nginx", "nginx-compression"]
 crate-type = ["cdylib"]
 
 [dependencies]
-mbrotli = { version = "0.5.11", default-features = false, features = ["std", "compression"] }
+mbrotli = { version = "0.5.15", default-features = false, features = ["std", "compression"] }
 ngx = { version = "0.5.1", default-features = false, features = ["std"] }
 # Required by build.rs to receive DEP_NGINX_* metadata.
 nginx-sys = "0.5.0"
 
 [dev-dependencies]
 # Tests decode what the filter produces.
-mbrotli = { version = "0.5.11", default-features = false, features = ["std", "compression", "decompression"] }
+mbrotli = { version = "0.5.15", default-features = false, features = ["std", "compression", "decompression"] }
 
 [build-dependencies]
 cc = "1.2"
