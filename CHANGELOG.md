@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.4 — 2026-10-18
+
+### Patch changes
+
+- Update mbrotli with a new perf optiomizations
+
 ## 0.4.3 — 2026-10-14
 
 ### Patch changes
