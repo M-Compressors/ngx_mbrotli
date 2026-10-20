@@ -1,0 +1,21 @@
+#!/bin/sh
+# nginx-module-mbrotli: like nginx.org's own nginx-module-* packages, the
+# module is installed but not enabled.
+set -e
+
+if [ "$1" = configure ] && [ -z "$2" ]; then
+    cat <<BANNER
+----------------------------------------------------------------------
+
+The Brotli compression module ngx_mbrotli for nginx has been installed.
+To enable it, add the following to the top of /etc/nginx/nginx.conf
+and reload nginx:
+
+    load_module modules/ngx_mbrotli.so;
+
+Please refer to the module documentation for further details:
+https://github.com/M-Compressors/ngx_mbrotli
+
+----------------------------------------------------------------------
+BANNER
+fi
