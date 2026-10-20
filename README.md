@@ -21,6 +21,41 @@ many requests as google/ngx_brotli at levels 4–6 on 85 KB–2.2 MB responses, 
 4.3–15 times as many at levels 9–11, while other requests keep the latency they
 have with no compression at all.
 
+## Contents
+
+- [Example](#example)
+- [Installation from packages](#installation-from-packages)
+- [Building](#building)
+- [Configuration directives](#configuration-directives)
+  - [`brotli_static`](#brotli_static)
+  - [`brotli`](#brotli)
+  - [`brotli_types`](#brotli_types)
+  - [`brotli_buffers`](#brotli_buffers)
+  - [`brotli_comp_level`](#brotli_comp_level)
+  - [`brotli_window`](#brotli_window)
+  - [`brotli_min_length`](#brotli_min_length)
+  - [`brotli_reuse_memory`](#brotli_reuse_memory)
+  - [`brotli_retention_policy`](#brotli_retention_policy)
+  - [`brotli_idle_encoders`](#brotli_idle_encoders)
+  - [`brotli_thread_pool`](#brotli_thread_pool)
+  - [`brotli_parallel_segment_size`](#brotli_parallel_segment_size)
+  - [`brotli_parallel_tasks`](#brotli_parallel_tasks)
+  - [`brotli_parallel_compressors`](#brotli_parallel_compressors)
+- [Variables](#variables)
+  - [`$brotli_ratio`](#brotli_ratio)
+- [Sample configuration](#sample-configuration)
+- [Differences from google/ngx_brotli](#differences-from-googlengx_brotli)
+- [Benchmarks](#benchmarks)
+  - [Requests per second](#requests-per-second)
+  - [Latency of other requests](#latency-of-other-requests)
+  - [A single large response](#a-single-large-response)
+  - [Worker memory](#worker-memory)
+  - [Segment size](#segment-size)
+- [Implementation notes](#implementation-notes)
+- [Testing](#testing)
+- [Contributing and releases](#contributing-and-releases)
+- [License](#license)
+
 ## Example
 
 Compression on a thread pool, so that long responses and high levels do not hold
