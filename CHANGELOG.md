@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.5 — 2026-10-20
+
+### Patch changes
+
+- [6865dba](https://github.com/M-Compressors/ngx_mbrotli/commit/6865dba2b4df5a56d16359a3dde614926f37ae6d) Prebuilt deb and rpm packages for amd64 and arm64 on Cloudsmith: `nginx-module-mbrotli` for nginx.org's stable and mainline nginx, on every distribution release nginx.org packages for, and `libnginx-mod-http-mbrotli` and `nginx-mod-mbrotli` for the nginx of Debian, Ubuntu, RHEL-compatible distributions and Fedora, from 1.25.4 on. See "Installation from packages" in the README. — Thanks @Mnwa!
+
 ## 0.4.4 — 2026-10-18
 
 ### Patch changes
