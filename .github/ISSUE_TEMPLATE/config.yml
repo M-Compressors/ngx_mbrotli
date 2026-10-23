@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/M-Compressors/ngx_mbrotli/security/advisories/new
+    about: Report vulnerabilities privately, not as public issues.
+  - name: Configuration directives
+    url: https://github.com/M-Compressors/ngx_mbrotli#configuration-directives
+    about: Every directive, its default and context are documented in the README.
+  - name: Encoder issues
+    url: https://github.com/M-Compressors/mbrotli/issues
+    about: Problems with the Brotli encoder itself belong in mbrotli.

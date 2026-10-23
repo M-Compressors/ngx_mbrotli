@@ -1,0 +1,53 @@
+name: Differs from google/ngx_brotli
+description: The same configuration behaves differently than with google/ngx_brotli.
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ngx_mbrotli is meant as a drop-in replacement for
+        [google/ngx_brotli](https://github.com/google/ngx_brotli): the same directives, defaults and
+        variable. Some differences are deliberate; check
+        [Differences from google/ngx_brotli](https://github.com/M-Compressors/ngx_mbrotli#differences-from-googlengx_brotli)
+        first.
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: The configuration that behaves differently.
+      render: nginx
+    validations:
+      required: true
+  - type: textarea
+    id: upstream
+    attributes:
+      label: Behaviour with google/ngx_brotli
+      description: Which version you compared with, and what it does (headers, body, errors, log messages).
+    validations:
+      required: true
+  - type: textarea
+    id: ours
+    attributes:
+      label: Behaviour with ngx_mbrotli
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Request
+      description: A request that shows the difference, such as a `curl` command.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: ngx_mbrotli version or commit
+      placeholder: 0.4.5
+    validations:
+      required: true
+  - type: input
+    id: nginx
+    attributes:
+      label: NGINX version
+      placeholder: "1.30.5"
+    validations:
+      required: true
