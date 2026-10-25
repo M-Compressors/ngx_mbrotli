@@ -933,3 +933,67 @@ fn parallel_tasks_on_threads() {
     assert!(!model.buffered && !model.blocked);
     assert!(model.errors.borrow().is_empty());
 }
+
+/// Sends each event of an SSE stream with the flush flag, as an unbuffered
+/// proxy does, and checks that the client can decode it before the next one
+/// is sent.
+fn stream_events(mut f: BodyFilter<Model>, split: bool) {
+    let mut up = Upstream::default();
+    let mut so_far = Vec::new();
+    for i in 0..60usize {
+        let event = text(1 + (i * 937) % 9000);
+        so_far.extend_from_slice(&event);
+        let rc = if split && event.len() > 1 {
+            // The event arrives in pieces; only the last one is flushed.
+            let (head, tail) = event.split_at(event.len() / 2);
+            up.send(&mut f, &[Part::Data(head)]);
+            up.send(&mut f, &[Part::Flush(tail)])
+        } else {
+            up.send(&mut f, &[Part::Flush(&event)])
+        };
+        assert_ne!(rc, NGX_ERROR as ngx_int_t);
+
+        let mut calls = 0;
+        while f.host().buffered || !f.host().pending.is_empty() || !f.host().tasks.is_empty() {
+            calls += 1;
+            assert!(calls < 100_000, "event {i} is never delivered");
+            let rc = if f.host().tasks.is_empty() {
+                up.resume(&mut f)
+            } else {
+                up.complete(&mut f)
+            };
+            assert_ne!(rc, NGX_ERROR as ngx_int_t);
+        }
+        let model = f.host();
+        assert_eq!(model.flushes.last(), Some(&model.sent.len()), "event {i}");
+        assert_eq!(decode_prefix(&model.sent), so_far, "event {i}");
+        assert!(up.held.is_empty(), "event {i} is held back");
+    }
+    up.send(&mut f, &[Part::Last(&[])]);
+    up.finish(&mut f);
+    assert_eq!(decode(&f.host().sent), so_far);
+    assert!(f.host().errors.borrow().is_empty());
+}
+
+#[test]
+fn every_flushed_event_is_decodable_at_once() {
+    for (budget, bufs_num, bufs_size) in [
+        (None, 4, 4096),
+        (Some(100), 2, 256),
+        (Some(5000), 1, 128),
+        (Some(1), 1, 64),
+    ] {
+        for split in [false, true] {
+            stream_events(filter(budget, bufs_num, bufs_size), split);
+        }
+    }
+}
+
+#[test]
+fn parallel_every_flushed_event_is_decodable_at_once() {
+    for budget in [None, Some(300)] {
+        for split in [false, true] {
+            stream_events(parallel_filter(budget, 2), split);
+        }
+    }
+}
