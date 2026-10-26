@@ -938,10 +938,18 @@ fn parallel_tasks_on_threads() {
 /// proxy does, and checks that the client can decode it before the next one
 /// is sent.
 fn stream_events(mut f: BodyFilter<Model>, split: bool) {
+    // Miri runs the encoder and the decoder thousands of times slower.
+    let (events, max_len) = if cfg!(miri) { (12, 3000) } else { (60, 9000) };
     let mut up = Upstream::default();
     let mut so_far = Vec::new();
-    for i in 0..60usize {
-        let event = text(1 + (i * 937) % 9000);
+    // The client decodes the stream as it arrives, so each event costs its
+    // own bytes and not the whole stream so far.
+    let mut decoder = Decompressor::new(DecoderConfig::default()).unwrap();
+    let mut session = decoder.start(DecodeStreamConfig::default()).unwrap();
+    let mut out = vec![0; 1 << 16];
+    let mut received = 0;
+    for i in 0..events {
+        let event = text(1 + (i * 937) % max_len);
         so_far.extend_from_slice(&event);
         let rc = if split && event.len() > 1 {
             // The event arrives in pieces; only the last one is flushed.
@@ -966,7 +974,20 @@ fn stream_events(mut f: BodyFilter<Model>, split: bool) {
         }
         let model = f.host();
         assert_eq!(model.flushes.last(), Some(&model.sent.len()), "event {i}");
-        assert_eq!(decode_prefix(&model.sent), so_far, "event {i}");
+        let mut input = &model.sent[received..];
+        let mut decoded = Vec::new();
+        loop {
+            let progress = session
+                .process(input, &mut out, DecodeOperation::Process)
+                .unwrap();
+            input = &input[progress.consumed..];
+            decoded.extend_from_slice(&out[..progress.produced]);
+            if progress.status == DecoderStatus::NeedsInput {
+                break;
+            }
+        }
+        received = model.sent.len();
+        assert_eq!(decoded, event, "event {i}");
         assert!(up.held.is_empty(), "event {i} is held back");
     }
     up.send(&mut f, &[Part::Last(&[])]);
