@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.6 — 2026-11-01
+
+### Patch changes
+
+- [c453c0b](https://github.com/M-Compressors/ngx_mbrotli/commit/c453c0b944b9bde1aaefe470ac2a13e10e718b4b) Update mbrotli to 0.5.20, with a faster encoder at unchanged output. The benchmarks in the README are measured anew. — Thanks @Mnwa!
+
 ## 0.4.5 — 2026-10-20
 
 ### Patch changes
