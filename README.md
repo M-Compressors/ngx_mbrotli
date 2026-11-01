@@ -16,10 +16,9 @@ Both modules are built into one dynamic library, so one `load_module` line loads
 Unlike google/ngx_brotli, it can also compress on NGINX thread pools out of the
 box: one line, `brotli_thread_pool default;`, takes compression out of the
 worker's event loop and spreads it over the pool's threads. In the
-[benchmarks](#benchmarks), one worker with 4 threads serves 3.4–4.4 times as
+[benchmarks](#benchmarks), one worker with 4 threads serves 3.5–4.4 times as
 many requests as google/ngx_brotli at levels 4–6 on 85 KB–2.2 MB responses, and
-4.5–15 times as many at levels 9–11, while other requests keep the latency they
-have with no compression at all.
+4.5–14 times as many at levels 9–11.
 
 ## Contents
 
@@ -46,10 +45,9 @@ have with no compression at all.
 - [Sample configuration](#sample-configuration)
 - [Differences from google/ngx_brotli](#differences-from-googlengx_brotli)
 - [Benchmarks](#benchmarks)
-  - [Latency of other requests](#latency-of-other-requests)
-  - [One large response](#one-large-response)
+  - [Requests per second](#requests-per-second)
   - [CPU time per request](#cpu-time-per-request)
-  - [Thread pool overhead](#thread-pool-overhead)
+  - [Peak memory](#peak-memory)
 - [Implementation notes](#implementation-notes)
 - [Testing](#testing)
 - [Contributing and releases](#contributing-and-releases)
@@ -366,9 +364,9 @@ before it, a quarter of `brotli_parallel_segment_size` at most and never more
 than the window, so that its back-references can reach into it: 256 KiB for 1m
 segments with the default 512k window. At other levels a segment starts from
 nothing, and back-references do not cross segment boundaries. Either way, a
-response longer than one segment compresses worse than in one piece: in the
-[benchmarks](#benchmarks), by 0.1–0.6% at levels 4–9 and by 3.8–5.2% at
-level 11. A flush (for example with `proxy_buffering off`) ends the current
+response longer than one segment compresses worse than in one piece: on the
+1 MB and 2.2 MB files of the [benchmarks](#benchmarks), by 0.1–0.6% at levels
+4–9 and by 3.8–5.2% at level 11. A flush (for example with `proxy_buffering off`) ends the current
 segment early.
 
 Every worker process has its own threads, so `worker_processes` times the pool's
@@ -391,8 +389,7 @@ of its size of the input before it, and at other levels to none of it (see
 better a response compresses and, at levels 2–9, the less input is run through
 twice, but the fewer of its segments are compressed at once, and the more memory
 each of their encoders needs. Smaller segments spread responses over more
-threads and compress worse. See [Thread pool overhead](#thread-pool-overhead)
-for 1m and 4m compared.
+threads and compress worse.
 
 *Not in google/ngx_brotli.*
 
@@ -486,152 +483,93 @@ is on.
 
 ## Benchmarks
 
-One NGINX worker compressing static files on the fly with google/ngx_brotli and
-with ngx_mbrotli, both in the worker's event loop and on a thread pool of 4
-threads, with 1 or 4 tasks per response (`brotli_parallel_tasks`).
-google/ngx_brotli is used as shipped: commit
-[`a71f9312`](https://github.com/google/ngx_brotli/commit/a71f9312c2deb28875acc7bacfdd5695a111aa53)
-with the Brotli 1.1.0 it pins as a submodule. All run with default settings
-apart from `brotli_comp_level` and, on the pool, `brotli_thread_pool` and
-`brotli_parallel_tasks`, so ngx_mbrotli reuses encoders and cuts responses into
-1m segments. The worker and its pool share 4 CPUs.
+One NGINX worker compresses static files on the fly for 8 connections at once,
+in three setups:
 
-These are results of a reduced run under WSL2 (see *Hardware, build and
-method* at the end of this section): good for comparing the modules with each
-other, less so as absolute numbers.
+- **google/ngx_brotli**: as shipped, commit [`a71f9312`](https://github.com/google/ngx_brotli/commit/a71f9312c2deb28875acc7bacfdd5695a111aa53) with the Brotli 1.1.0 it pins as a submodule.
+- **Event loop**: ngx_mbrotli with its default settings, compressing in the worker's
+  event loop like google/ngx_brotli.
+- **Thread pool**: ngx_mbrotli with `brotli_thread_pool` on a pool of 4 threads, and
+  otherwise default settings: up to 4 tasks per response and 1m segments.
 
-With the thread pool:
+Only `brotli_comp_level` changes from row to row. The worker and its pool share 4
+CPUs. Each number is the median of three runs under WSL2 (see *Hardware, build
+and method* below): good for comparing the setups with each other, less so as
+absolute numbers.
 
-- **Other requests are not held up.** While large responses are compressed, the
-  99th percentile latency of small uncompressed requests on the same worker
-  stays at 1.7–1.8 ms, as when nothing is compressed (1.9 ms). With
-  google/ngx_brotli it grows to 17 ms at level 6 and 72 ms at level 11, and to
-  117–527 ms when 8 large requests arrive at once.
-- **One worker serves 3.4–15 times as many requests** as with
-  google/ngx_brotli on responses of 85 KB and more. The gain is largest at
-  levels 9–11.
-- **A 2.2 MB response is sent 1.9–2.3 times as fast with 4 tasks as with 1**,
-  and 1.9–5.4 times as fast as by google/ngx_brotli. Only responses longer than
-  one segment gain from more tasks.
-- **CPU time per request is 1.2–1.5 times higher** than in the event loop at
-  levels 4–9 on responses of 1 MB and more, and 37–38% lower at level 11. It
-  is higher than with google/ngx_brotli only at level 4. See [Thread pool
-  overhead](#thread-pool-overhead).
-- **Responses longer than one segment compress 0.1–0.6% worse** at levels 4–9
-  and 3.8–5.2% worse at level 11. Of the files here, only the 1 MB and 2.2 MB
-  ones are longer than the default 1m segment.
-- **A worker needs much more memory**: each response in flight holds encoders
-  for its segments, and with 8 connections a worker peaks at up to 1.1 GiB
-  (level 9, 2.2 MB response, 4 tasks). `brotli_retention_policy bounded <size>`
-  or `release_all` keep less of it between responses.
+### Requests per second
 
-In the event loop, compared with google/ngx_brotli:
+Higher is better. In brackets, relative to google/ngx_brotli.
 
-- **One worker serves 1.10–4.2 times as many requests** on responses of 85 KB
-  and more, the most on jquery.min.js at level 9: for every response over
-  64 KB at level 9, the C encoder allocates a 32 MiB hash table and frees it
-  afterwards.
-- **On 1.9 KB responses, it serves 4–122% more requests**, the most at level 6.
-  With the pool, ngx_mbrotli serves 1.5–6.1 times as many as
-  google/ngx_brotli.
-- **A worker's memory is 0–4 MiB higher**, except on jquery.min.js at level 9,
-  where it peaks at 8 MiB against 36 MiB.
-- **The event loop is blocked all the same.** Small requests wait 21–45% less,
-  only because compression itself is faster.
-
-### Latency of other requests
-
-The 99th percentile latency of small uncompressed requests, 1,000 per second,
-while one connection requests a large compressed response at a fixed rate,
-about half of what google/ngx_brotli can serve, in ms:
-
-| Level, large requests | No compression | ngx_brotli | ngx_mbrotli, event loop | ngx_mbrotli, pool, 1 task | ngx_mbrotli, pool, 4 tasks |
-|---|--:|--:|--:|--:|--:|
-| 6, react-dom.development.js (1.03 MB), 31 per second | 1.9 | 17.0 | 13.5 | 1.8 | 1.7 |
-| 11, jquery.min.js (85 KB), 7 per second | 1.9 | 72.2 | 43.2 | 1.8 | 1.8 |
-
-On the pool, no small request takes more than 4.0 ms. When the large requests
-come from 8 connections at once, google/ngx_brotli compresses them one after
-another, so at level 11 small requests wait for up to 8 × 70 ms (p99 527 ms);
-on the pool they stay at 1.9–3.1 ms. The large responses themselves then take
-a median 69 ms with 4 tasks, 70 ms with 1 task and 280 ms with
-google/ngx_brotli at level 11, and 21, 28 and 71 ms at level 6.
-
-### One large response
-
-Time to send libraries.json (2.2 MB, 3 segments of 1m) over one connection, one
-response at a time, median of three runs, in ms:
-
-| Level | ngx_brotli | ngx_mbrotli, event loop | ngx_mbrotli, pool, 1 task | ngx_mbrotli, pool, 4 tasks |
-|--:|--:|--:|--:|--:|
-| 4 | 14.9 | 13.0 | 15.1 | 7.8 |
-| 6 | 31.6 | 24.9 | 27.1 | 13.6 |
-| 9 | 72.9 | 46.6 | 58.9 | 25.2 |
-| 11 | 2,004 | 1,113 | 771 | 371 |
-
-The gain from more tasks is bounded by the number of segments: react-dom (1 MiB
-and 31 KB) is only 4–50% faster with 4 tasks than with 1, and responses up to
-1 MiB do not depend on the number of tasks at all. At level 11 even 1 task is
-faster than the event loop, because 1 MiB segments compress faster than a
-whole file.
+| Response | Level | google/ngx_brotli | Event loop | Thread pool |
+|---|--:|--:|--:|--:|
+| small.json, 1.9 KB | 4 | 28,370 | 31,114 (1.10×) | 42,238 (1.49×) |
+| small.json, 1.9 KB | 6 | 12,750 | 28,301 (2.22×) | 41,483 (3.25×) |
+| small.json, 1.9 KB | 9 | 23,218 | 24,194 (1.04×) | 36,406 (1.57×) |
+| small.json, 1.9 KB | 11 | 613 | 965 (1.57×) | 3,714 (6.06×) |
+| jquery.min.js, 85 KB | 4 | 955 | 1,145 (1.20×) | 4,177 (4.37×) |
+| jquery.min.js, 85 KB | 6 | 655 | 717 (1.10×) | 2,559 (3.91×) |
+| jquery.min.js, 85 KB | 9 | 104 | 442 (4.24×) | 1,452 (13.9×) |
+| jquery.min.js, 85 KB | 11 | 14.5 | 25.4 (1.75×) | 99.9 (6.88×) |
+| react-dom.development.js, 1.03 MB | 4 | 130 | 152 (1.17×) | 448 (3.45×) |
+| react-dom.development.js, 1.03 MB | 6 | 61.5 | 79.4 (1.29×) | 265 (4.30×) |
+| react-dom.development.js, 1.03 MB | 9 | 24.0 | 42.6 (1.78×) | 128 (5.33×) |
+| react-dom.development.js, 1.03 MB | 11 | 1.00 | 1.70 (1.70×) | 9.96 (9.96×) |
+| libraries.json, 2.2 MB | 4 | 67.1 | 76.9 (1.15×) | 240 (3.58×) |
+| libraries.json, 2.2 MB | 6 | 31.9 | 40.8 (1.28×) | 133 (4.16×) |
+| libraries.json, 2.2 MB | 9 | 14.0 | 21.6 (1.54×) | 63.5 (4.54×) |
+| libraries.json, 2.2 MB | 11 | 0.520 | 0.900 (1.73×) | 5.39 (10.4×) |
 
 ### CPU time per request
 
-The worker's CPU time per request, including the pool's threads, with 8
-connections, median of three runs, in ms:
+The worker's user and system CPU time per request, including the pool's
+threads, in ms. Lower is better. On the thread pool, responses longer than one
+segment (1 MB and more here) cost more at levels 4–9, because every segment but
+the first also runs through part of the input before it, and less at level 11,
+because 1 MiB segments compress faster than a whole file.
 
-| Response | Level | ngx_brotli | ngx_mbrotli, event loop | ngx_mbrotli, pool, 1 task | ngx_mbrotli, pool, 4 tasks |
-|---|--:|--:|--:|--:|--:|
-| react-dom.development.js, 1.03 MB | 4 | 7.8 | 6.6 | 9.0 | 8.9 |
-| react-dom.development.js, 1.03 MB | 6 | 16.5 | 12.7 | 15.3 | 15.1 |
-| react-dom.development.js, 1.03 MB | 9 | 43.4 | 23.9 | 35.1 | 31.4 |
-| react-dom.development.js, 1.03 MB | 11 | 1,188 | 651 | 405 | 408 |
-| libraries.json, 2.2 MB | 4 | 15.1 | 13.1 | 17.2 | 16.7 |
-| libraries.json, 2.2 MB | 6 | 32.1 | 24.8 | 29.5 | 30.2 |
-| libraries.json, 2.2 MB | 9 | 75.7 | 47.6 | 61.6 | 63.5 |
-| libraries.json, 2.2 MB | 11 | 2,522 | 1,207 | 765 | 766 |
+| Response | Level | google/ngx_brotli | Event loop | Thread pool |
+|---|--:|--:|--:|--:|
+| small.json, 1.9 KB | 4 | 0.035 | 0.032 | 0.050 |
+| small.json, 1.9 KB | 6 | 0.078 | 0.035 | 0.054 |
+| small.json, 1.9 KB | 9 | 0.043 | 0.041 | 0.075 |
+| small.json, 1.9 KB | 11 | 1.63 | 1.04 | 1.06 |
+| jquery.min.js, 85 KB | 4 | 1.05 | 0.875 | 0.922 |
+| jquery.min.js, 85 KB | 6 | 1.53 | 1.40 | 1.53 |
+| jquery.min.js, 85 KB | 9 | 9.74 | 2.27 | 2.72 |
+| jquery.min.js, 85 KB | 11 | 70.5 | 39.9 | 40.1 |
+| react-dom.development.js, 1.03 MB | 4 | 7.76 | 6.60 | 8.92 |
+| react-dom.development.js, 1.03 MB | 6 | 16.5 | 12.7 | 15.1 |
+| react-dom.development.js, 1.03 MB | 9 | 43.4 | 23.9 | 31.4 |
+| react-dom.development.js, 1.03 MB | 11 | 1,188 | 651 | 408 |
+| libraries.json, 2.2 MB | 4 | 15.1 | 13.1 | 16.7 |
+| libraries.json, 2.2 MB | 6 | 32.1 | 24.8 | 30.2 |
+| libraries.json, 2.2 MB | 9 | 75.7 | 47.6 | 63.5 |
+| libraries.json, 2.2 MB | 11 | 2,522 | 1,207 | 766 |
 
-### Thread pool overhead
+### Peak memory
 
-The extra CPU time on the pool at levels 4–9 has two measured causes:
+The worker's peak resident set size (`VmHWM`), in MiB. Lower is better. On the
+thread pool, every response in flight holds encoders for its segments.
 
-- **Segment history.** At levels 2–9, every segment but the first first runs
-  through the quarter segment of input before it, within the window, so that
-  its matches can reach back: 256 KiB for each 1 MiB segment. Levels 10 and 11
-  take no history and start every segment from nothing, so their segments
-  compress worse but cost no extra time.
-- **Encoders allocated anew.** A worker keeps encoders for
-  `brotli_parallel_compressors` compressors, 4 by default; with 8 responses in
-  flight, the others allocate their encoders for every response. At level 9 on
-  libraries.json with 8 connections and 4 tasks, `brotli_parallel_compressors 8`
-  lowers CPU time per request from 64 to 54 ms and serves 20% more requests,
-  and the worker's peak memory grows from 1.1 to 1.3 GiB. With 1 task it
-  changes neither (62 ms).
-
-Even a response that fits in one segment costs 1.11–1.24 times the event loop's
-CPU time on the pool at levels 4–9.
-
-A larger `brotli_parallel_segment_size` means less history to run through. With
-4m, both files here fit in one segment, so a response is compressed by one task
-without history. With 1 task and 8 connections:
-
-| Response | Level | CPU, event loop | CPU, 1m | CPU, 4m | Peak memory, 1m | Peak memory, 4m |
-|---|--:|--:|--:|--:|--:|--:|
-| react-dom.development.js, 1.03 MB | 4 | 6.6 ms | 9.0 ms | 8.2 ms | 114 MiB | 114 MiB |
-| react-dom.development.js, 1.03 MB | 6 | 12.7 ms | 15.4 ms | 14.1 ms | 155 MiB | 137 MiB |
-| react-dom.development.js, 1.03 MB | 9 | 23.9 ms | 34.7 ms | 29.5 ms | 584 MiB | 332 MiB |
-| react-dom.development.js, 1.03 MB | 11 | 651 ms | 405 ms | 612 ms | 277 MiB | 222 MiB |
-| libraries.json, 2.2 MB | 4 | 13.1 ms | 17.1 ms | 15.1 ms | 139 MiB | 133 MiB |
-| libraries.json, 2.2 MB | 6 | 24.8 ms | 29.4 ms | 27.5 ms | 174 MiB | 145 MiB |
-| libraries.json, 2.2 MB | 9 | 47.6 ms | 61.5 ms | 53.8 ms | 587 MiB | 338 MiB |
-| libraries.json, 2.2 MB | 11 | 1,207 ms | 758 ms | 1,162 ms | 350 MiB | 231 MiB |
-
-With 4m, CPU time per request at levels 4–9 is 1.11–1.24 times the event
-loop's instead of 1.19–1.45 times, a worker serves 7–19% more requests, and the
-output is the same size as in the event loop. At level 11 it serves 32–33%
-fewer, because a whole file compresses slower than 1 MiB segments. In
-exchange, only responses longer than 4 MiB are compressed by more than one
-thread at once.
+| Response | Level | google/ngx_brotli | Event loop | Thread pool |
+|---|--:|--:|--:|--:|
+| small.json, 1.9 KB | 4 | 5 | 6 | 9 |
+| small.json, 1.9 KB | 6 | 5 | 6 | 15 |
+| small.json, 1.9 KB | 9 | 6 | 7 | 22 |
+| small.json, 1.9 KB | 11 | 6 | 6 | 21 |
+| jquery.min.js, 85 KB | 4 | 5 | 6 | 22 |
+| jquery.min.js, 85 KB | 6 | 7 | 8 | 45 |
+| jquery.min.js, 85 KB | 9 | 36 | 8 | 43 |
+| jquery.min.js, 85 KB | 11 | 9 | 11 | 68 |
+| react-dom.development.js, 1.03 MB | 4 | 9 | 12 | 141 |
+| react-dom.development.js, 1.03 MB | 6 | 11 | 14 | 169 |
+| react-dom.development.js, 1.03 MB | 9 | 39 | 41 | 500 |
+| react-dom.development.js, 1.03 MB | 11 | 25 | 28 | 264 |
+| libraries.json, 2.2 MB | 4 | 9 | 13 | 220 |
+| libraries.json, 2.2 MB | 6 | 10 | 14 | 273 |
+| libraries.json, 2.2 MB | 9 | 39 | 42 | 1,089 |
+| libraries.json, 2.2 MB | 11 | 28 | 30 | 492 |
 
 <details>
 <summary>Hardware, build and method</summary>
@@ -655,42 +593,29 @@ thread at once.
 **Configuration**
 
 `worker_processes 1`, pinned to 4 CPUs on different physical cores, and
-`thread_pool cp threads=4`. On the pool, `brotli_thread_pool cp` with
-`brotli_parallel_tasks 1` or `4`. Everything else is left at its default,
-including `brotli_parallel_segment_size 1m`, `brotli_parallel_compressors 4`
-and `brotli_retention_policy aggressive`. Files are served from tmpfs.
+`thread_pool cp threads=4`. For the thread pool, `brotli_thread_pool cp`.
+Everything else is left at its default, including `brotli_parallel_tasks 4`,
+`brotli_parallel_segment_size 1m`, `brotli_parallel_compressors 4` and
+`brotli_retention_policy aggressive`. Files are served from tmpfs.
 
 **Load**
 
-- Over loopback, without TLS, from 4 other physical cores, and the small
-  requests of the latency test from 2 more.
-- Requests per second and CPU time: wrk 4.1.0, 2 threads and 8 connections, for
-  4 seconds (8 seconds for files over 1 MB, 5 times longer at level 11), after a
-  1-second warm-up. Each run starts NGINX anew and waits until the worker has
-  been idle for 300 ms. Three runs in a shuffled order; the tables show the
-  median.
-- Time to send one response: the same with 1 connection, for 4 seconds
-  (10 seconds at level 11), divided by the number of responses.
-- CPU time per request is the worker's user and system time over the run, from
-  `/proc/<pid>/stat`, including the pool's threads; peak memory is the worker's
-  `VmHWM`.
-- Latency of other requests: wrk2 (`44a94c1`), open loop with coordinated
-  omission corrected, two streams at once: small.json without
-  compression at 1,000 requests per second over 32 connections, and the large
-  compressed response at a fixed rate, over 1 connection (one 30-second run) or
-  8 connections (median of three 30-second runs).
-- Every response, for every module, level and file, was decoded with curl's
+- wrk 4.1.0 over loopback, without TLS, from 4 other physical cores, with 2
+  threads and 8 connections, for 4 seconds (8 seconds for files over 1 MB, 5
+  times longer at level 11), after a 1-second warm-up.
+- Each run starts NGINX anew and waits until the worker has been idle for
+  300 ms. Three runs in a shuffled order; the tables show the median.
+- CPU time is read from `/proc/<pid>/stat` of the worker, including the pool's
+  threads, and peak memory from `VmHWM` in `/proc/<pid>/status`.
+- Every response, for every setup, level and file, was decoded with curl's
   Brotli decoder and compared with the original file by SHA-256.
 
 **Files**
 
-jQuery 3.7.1 (`jquery.min.js`, 85 KB) and React DOM 18.3.1
-(`react-dom.development.js`, 1.03 MB) from cdnjs, the full cdnjs API listing
-(`libraries.json`, 2.2 MB), and its first 10 entries (`small.json`, 1.9 KB),
-fetched on 2026-10-20. Measured on 2026-11-01.
-
-Not measured yet: more than one worker, slow clients, long runs and
-compression ratios beyond the correctness check.
+jQuery 3.7.1 (`jquery.min.js`) and React DOM 18.3.1
+(`react-dom.development.js`) from cdnjs, the full cdnjs API listing
+(`libraries.json`), and its first 10 entries (`small.json`), fetched on
+2026-10-20. Measured on 2026-11-01.
 
 </details>
 
