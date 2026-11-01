@@ -484,13 +484,14 @@ is on.
 ## Benchmarks
 
 One NGINX worker compresses static files on the fly for 8 connections at once,
-in three setups:
+in four setups:
 
 - **google/ngx_brotli**: as shipped, commit [`a71f9312`](https://github.com/google/ngx_brotli/commit/a71f9312c2deb28875acc7bacfdd5695a111aa53) with the Brotli 1.1.0 it pins as a submodule.
-- **Event loop**: ngx_mbrotli with its default settings, compressing in the worker's
-  event loop like google/ngx_brotli.
-- **Thread pool**: ngx_mbrotli with `brotli_thread_pool` on a pool of 4 threads, and
-  otherwise default settings: up to 4 tasks per response and 1m segments.
+- **ngx_mbrotli, event loop**: ngx_mbrotli with its default settings, compressing in the
+  worker's event loop like google/ngx_brotli.
+- **ngx_mbrotli, pool, 1 task** and **4 tasks**: ngx_mbrotli with `brotli_thread_pool` on a
+  pool of 4 threads and `brotli_parallel_tasks 1` or `4` (the default), so that one
+  response is compressed by up to 1 or 4 threads at once, in 1m segments.
 
 Only `brotli_comp_level` changes from row to row. The worker and its pool share 4
 CPUs. Each number is the median of three runs under WSL2 (see *Hardware, build
@@ -501,75 +502,75 @@ absolute numbers.
 
 Higher is better. In brackets, relative to google/ngx_brotli.
 
-| Response | Level | google/ngx_brotli | Event loop | Thread pool |
-|---|--:|--:|--:|--:|
-| small.json, 1.9 KB | 4 | 28,370 | 31,114 (1.10×) | 42,238 (1.49×) |
-| small.json, 1.9 KB | 6 | 12,750 | 28,301 (2.22×) | 41,483 (3.25×) |
-| small.json, 1.9 KB | 9 | 23,218 | 24,194 (1.04×) | 36,406 (1.57×) |
-| small.json, 1.9 KB | 11 | 613 | 965 (1.57×) | 3,714 (6.06×) |
-| jquery.min.js, 85 KB | 4 | 955 | 1,145 (1.20×) | 4,177 (4.37×) |
-| jquery.min.js, 85 KB | 6 | 655 | 717 (1.10×) | 2,559 (3.91×) |
-| jquery.min.js, 85 KB | 9 | 104 | 442 (4.24×) | 1,452 (13.9×) |
-| jquery.min.js, 85 KB | 11 | 14.5 | 25.4 (1.75×) | 99.9 (6.88×) |
-| react-dom.development.js, 1.03 MB | 4 | 130 | 152 (1.17×) | 448 (3.45×) |
-| react-dom.development.js, 1.03 MB | 6 | 61.5 | 79.4 (1.29×) | 265 (4.30×) |
-| react-dom.development.js, 1.03 MB | 9 | 24.0 | 42.6 (1.78×) | 128 (5.33×) |
-| react-dom.development.js, 1.03 MB | 11 | 1.00 | 1.70 (1.70×) | 9.96 (9.96×) |
-| libraries.json, 2.2 MB | 4 | 67.1 | 76.9 (1.15×) | 240 (3.58×) |
-| libraries.json, 2.2 MB | 6 | 31.9 | 40.8 (1.28×) | 133 (4.16×) |
-| libraries.json, 2.2 MB | 9 | 14.0 | 21.6 (1.54×) | 63.5 (4.54×) |
-| libraries.json, 2.2 MB | 11 | 0.520 | 0.900 (1.73×) | 5.39 (10.4×) |
+| Response | Level | google/ngx_brotli | ngx_mbrotli, event loop | ngx_mbrotli, pool, 1 task | ngx_mbrotli, pool, 4 tasks |
+|---|--:|--:|--:|--:|--:|
+| small.json, 1.9 KB | 4 | 28,370 | 31,114 (1.10×) | 41,653 (1.47×) | 42,238 (1.49×) |
+| small.json, 1.9 KB | 6 | 12,750 | 28,301 (2.22×) | 41,624 (3.26×) | 41,483 (3.25×) |
+| small.json, 1.9 KB | 9 | 23,218 | 24,194 (1.04×) | 40,078 (1.73×) | 36,406 (1.57×) |
+| small.json, 1.9 KB | 11 | 613 | 965 (1.57×) | 3,717 (6.06×) | 3,714 (6.06×) |
+| jquery.min.js, 85 KB | 4 | 955 | 1,145 (1.20×) | 4,196 (4.39×) | 4,177 (4.37×) |
+| jquery.min.js, 85 KB | 6 | 655 | 717 (1.10×) | 2,603 (3.98×) | 2,559 (3.91×) |
+| jquery.min.js, 85 KB | 9 | 104 | 442 (4.24×) | 1,552 (14.9×) | 1,452 (13.9×) |
+| jquery.min.js, 85 KB | 11 | 14.5 | 25.4 (1.75×) | 100.0 (6.88×) | 99.9 (6.88×) |
+| react-dom.development.js, 1.03 MB | 4 | 130 | 152 (1.17×) | 443 (3.41×) | 448 (3.45×) |
+| react-dom.development.js, 1.03 MB | 6 | 61.5 | 79.4 (1.29×) | 261 (4.24×) | 265 (4.30×) |
+| react-dom.development.js, 1.03 MB | 9 | 24.0 | 42.6 (1.78×) | 111 (4.63×) | 128 (5.33×) |
+| react-dom.development.js, 1.03 MB | 11 | 1.00 | 1.70 (1.70×) | 9.93 (9.93×) | 9.96 (9.96×) |
+| libraries.json, 2.2 MB | 4 | 67.1 | 76.9 (1.15×) | 232 (3.45×) | 240 (3.58×) |
+| libraries.json, 2.2 MB | 6 | 31.9 | 40.8 (1.28×) | 135 (4.24×) | 133 (4.16×) |
+| libraries.json, 2.2 MB | 9 | 14.0 | 21.6 (1.54×) | 65.1 (4.65×) | 63.5 (4.54×) |
+| libraries.json, 2.2 MB | 11 | 0.520 | 0.900 (1.73×) | 5.27 (10.1×) | 5.39 (10.4×) |
 
 ### CPU time per request
 
 The worker's user and system CPU time per request, including the pool's
-threads, in ms. Lower is better. On the thread pool, responses longer than one
-segment (1 MB and more here) cost more at levels 4–9, because every segment but
-the first also runs through part of the input before it, and less at level 11,
+threads, in ms. Lower is better. On the pool, responses longer than one segment
+(1 MB and more here) cost more at levels 4–9, because every segment but the
+first also runs through part of the input before it, and less at level 11,
 because 1 MiB segments compress faster than a whole file.
 
-| Response | Level | google/ngx_brotli | Event loop | Thread pool |
-|---|--:|--:|--:|--:|
-| small.json, 1.9 KB | 4 | 0.035 | 0.032 | 0.050 |
-| small.json, 1.9 KB | 6 | 0.078 | 0.035 | 0.054 |
-| small.json, 1.9 KB | 9 | 0.043 | 0.041 | 0.075 |
-| small.json, 1.9 KB | 11 | 1.63 | 1.04 | 1.06 |
-| jquery.min.js, 85 KB | 4 | 1.05 | 0.875 | 0.922 |
-| jquery.min.js, 85 KB | 6 | 1.53 | 1.40 | 1.53 |
-| jquery.min.js, 85 KB | 9 | 9.74 | 2.27 | 2.72 |
-| jquery.min.js, 85 KB | 11 | 70.5 | 39.9 | 40.1 |
-| react-dom.development.js, 1.03 MB | 4 | 7.76 | 6.60 | 8.92 |
-| react-dom.development.js, 1.03 MB | 6 | 16.5 | 12.7 | 15.1 |
-| react-dom.development.js, 1.03 MB | 9 | 43.4 | 23.9 | 31.4 |
-| react-dom.development.js, 1.03 MB | 11 | 1,188 | 651 | 408 |
-| libraries.json, 2.2 MB | 4 | 15.1 | 13.1 | 16.7 |
-| libraries.json, 2.2 MB | 6 | 32.1 | 24.8 | 30.2 |
-| libraries.json, 2.2 MB | 9 | 75.7 | 47.6 | 63.5 |
-| libraries.json, 2.2 MB | 11 | 2,522 | 1,207 | 766 |
+| Response | Level | google/ngx_brotli | ngx_mbrotli, event loop | ngx_mbrotli, pool, 1 task | ngx_mbrotli, pool, 4 tasks |
+|---|--:|--:|--:|--:|--:|
+| small.json, 1.9 KB | 4 | 0.035 | 0.032 | 0.051 | 0.050 |
+| small.json, 1.9 KB | 6 | 0.078 | 0.035 | 0.054 | 0.054 |
+| small.json, 1.9 KB | 9 | 0.043 | 0.041 | 0.071 | 0.075 |
+| small.json, 1.9 KB | 11 | 1.63 | 1.04 | 1.06 | 1.06 |
+| jquery.min.js, 85 KB | 4 | 1.05 | 0.875 | 0.920 | 0.922 |
+| jquery.min.js, 85 KB | 6 | 1.53 | 1.40 | 1.51 | 1.53 |
+| jquery.min.js, 85 KB | 9 | 9.74 | 2.27 | 2.55 | 2.72 |
+| jquery.min.js, 85 KB | 11 | 70.5 | 39.9 | 40.1 | 40.1 |
+| react-dom.development.js, 1.03 MB | 4 | 7.76 | 6.60 | 9.00 | 8.92 |
+| react-dom.development.js, 1.03 MB | 6 | 16.5 | 12.7 | 15.3 | 15.1 |
+| react-dom.development.js, 1.03 MB | 9 | 43.4 | 23.9 | 35.1 | 31.4 |
+| react-dom.development.js, 1.03 MB | 11 | 1,188 | 651 | 405 | 408 |
+| libraries.json, 2.2 MB | 4 | 15.1 | 13.1 | 17.2 | 16.7 |
+| libraries.json, 2.2 MB | 6 | 32.1 | 24.8 | 29.5 | 30.2 |
+| libraries.json, 2.2 MB | 9 | 75.7 | 47.6 | 61.6 | 63.5 |
+| libraries.json, 2.2 MB | 11 | 2,522 | 1,207 | 765 | 766 |
 
 ### Peak memory
 
 The worker's peak resident set size (`VmHWM`), in MiB. Lower is better. On the
 thread pool, every response in flight holds encoders for its segments.
 
-| Response | Level | google/ngx_brotli | Event loop | Thread pool |
-|---|--:|--:|--:|--:|
-| small.json, 1.9 KB | 4 | 5 | 6 | 9 |
-| small.json, 1.9 KB | 6 | 5 | 6 | 15 |
-| small.json, 1.9 KB | 9 | 6 | 7 | 22 |
-| small.json, 1.9 KB | 11 | 6 | 6 | 21 |
-| jquery.min.js, 85 KB | 4 | 5 | 6 | 22 |
-| jquery.min.js, 85 KB | 6 | 7 | 8 | 45 |
-| jquery.min.js, 85 KB | 9 | 36 | 8 | 43 |
-| jquery.min.js, 85 KB | 11 | 9 | 11 | 68 |
-| react-dom.development.js, 1.03 MB | 4 | 9 | 12 | 141 |
-| react-dom.development.js, 1.03 MB | 6 | 11 | 14 | 169 |
-| react-dom.development.js, 1.03 MB | 9 | 39 | 41 | 500 |
-| react-dom.development.js, 1.03 MB | 11 | 25 | 28 | 264 |
-| libraries.json, 2.2 MB | 4 | 9 | 13 | 220 |
-| libraries.json, 2.2 MB | 6 | 10 | 14 | 273 |
-| libraries.json, 2.2 MB | 9 | 39 | 42 | 1,089 |
-| libraries.json, 2.2 MB | 11 | 28 | 30 | 492 |
+| Response | Level | google/ngx_brotli | ngx_mbrotli, event loop | ngx_mbrotli, pool, 1 task | ngx_mbrotli, pool, 4 tasks |
+|---|--:|--:|--:|--:|--:|
+| small.json, 1.9 KB | 4 | 5 | 6 | 9 | 9 |
+| small.json, 1.9 KB | 6 | 5 | 6 | 15 | 15 |
+| small.json, 1.9 KB | 9 | 6 | 7 | 22 | 22 |
+| small.json, 1.9 KB | 11 | 6 | 6 | 21 | 21 |
+| jquery.min.js, 85 KB | 4 | 5 | 6 | 22 | 22 |
+| jquery.min.js, 85 KB | 6 | 7 | 8 | 46 | 45 |
+| jquery.min.js, 85 KB | 9 | 36 | 8 | 48 | 43 |
+| jquery.min.js, 85 KB | 11 | 9 | 11 | 67 | 68 |
+| react-dom.development.js, 1.03 MB | 4 | 9 | 12 | 113 | 141 |
+| react-dom.development.js, 1.03 MB | 6 | 11 | 14 | 149 | 169 |
+| react-dom.development.js, 1.03 MB | 9 | 39 | 41 | 578 | 500 |
+| react-dom.development.js, 1.03 MB | 11 | 25 | 28 | 238 | 264 |
+| libraries.json, 2.2 MB | 4 | 9 | 13 | 137 | 220 |
+| libraries.json, 2.2 MB | 6 | 10 | 14 | 174 | 273 |
+| libraries.json, 2.2 MB | 9 | 39 | 42 | 563 | 1,089 |
+| libraries.json, 2.2 MB | 11 | 28 | 30 | 376 | 492 |
 
 <details>
 <summary>Hardware, build and method</summary>
@@ -593,8 +594,8 @@ thread pool, every response in flight holds encoders for its segments.
 **Configuration**
 
 `worker_processes 1`, pinned to 4 CPUs on different physical cores, and
-`thread_pool cp threads=4`. For the thread pool, `brotli_thread_pool cp`.
-Everything else is left at its default, including `brotli_parallel_tasks 4`,
+`thread_pool cp threads=4`. On the pool, `brotli_thread_pool cp` with
+`brotli_parallel_tasks 1` or `4`. Everything else is left at its default, including
 `brotli_parallel_segment_size 1m`, `brotli_parallel_compressors 4` and
 `brotli_retention_policy aggressive`. Files are served from tmpfs.
 
