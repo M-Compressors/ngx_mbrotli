@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.7 — 2026-11-07
+
+### Patch changes
+
+- [bdc0a20](https://github.com/M-Compressors/ngx_mbrotli/commit/bdc0a20c384437865b46b7cbfb7ebb9588b5c305) Fix the build against freenginx, where `ngx_buf_tag_t` is `uintptr_t` rather than `void *`. CI now runs the unit and integration tests against freenginx too. — Thanks @Mnwa!
+
 ## 0.4.6 — 2026-11-01
 
 ### Patch changes
