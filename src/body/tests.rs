@@ -17,7 +17,6 @@
 //! that Miri checks what the tasks share with the filter for data races.
 
 use core::cell::RefCell;
-use core::ffi::c_void;
 use core::fmt;
 use core::ptr;
 use std::alloc::{Layout, alloc, dealloc};
@@ -31,7 +30,9 @@ use mbrotli::{
     DecodeOperation, DecodeStreamConfig, DecoderConfig, DecoderStatus, Decompressor, EncoderConfig,
     InputSize, Quality, RetentionPolicy, Window,
 };
-use ngx::ffi::{NGX_AGAIN, NGX_ERROR, NGX_OK, ngx_buf_t, ngx_chain_t, ngx_int_t, off_t};
+use ngx::ffi::{
+    NGX_AGAIN, NGX_ERROR, NGX_OK, ngx_buf_t, ngx_buf_tag_t, ngx_chain_t, ngx_int_t, off_t,
+};
 
 use super::{BodyFilter, BufFlags, Host, Parallel, Settings, window_bits};
 
@@ -131,8 +132,8 @@ impl Model {
         }
     }
 
-    fn tag(&self) -> *mut c_void {
-        ptr::from_ref::<u8>(&self.tag).cast_mut().cast()
+    fn tag(&self) -> ngx_buf_tag_t {
+        ptr::from_ref::<u8>(&self.tag).cast_mut() as ngx_buf_tag_t
     }
 
     fn alloc_buf(&mut self) -> *mut ngx_buf_t {
