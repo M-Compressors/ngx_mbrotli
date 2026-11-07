@@ -17,17 +17,17 @@ use ngx::ffi::{
     NGX_HTTP_FORBIDDEN, NGX_HTTP_GZIP_BUFFERED, NGX_HTTP_LIF_CONF, NGX_HTTP_LOC_CONF,
     NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE,
     NGX_HTTP_NOT_FOUND, NGX_HTTP_OK, NGX_HTTP_SRV_CONF, NGX_LOG_ALERT, NGX_LOG_EMERG, NGX_OK,
-    ngx_alloc_chain_link, ngx_array_t, ngx_buf_t, ngx_bufs_t, ngx_chain_add_copy, ngx_chain_t,
-    ngx_chain_update_chains, ngx_command_t, ngx_conf_check_num_bounds, ngx_conf_num_bounds_t,
-    ngx_conf_post_t, ngx_conf_set_bufs_slot, ngx_conf_set_flag_slot, ngx_conf_set_num_slot,
-    ngx_conf_set_size_slot, ngx_conf_t, ngx_create_temp_buf, ngx_cycle_t, ngx_flag_t, ngx_hash_t,
-    ngx_http_add_variable, ngx_http_conf_ctx_t, ngx_http_html_default_types, ngx_http_merge_types,
-    ngx_http_module, ngx_http_module_t, ngx_http_output_body_filter_pt,
-    ngx_http_output_header_filter_pt, ngx_http_request_t, ngx_http_test_content_type,
-    ngx_http_top_body_filter, ngx_http_top_header_filter, ngx_http_types_slot,
-    ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_log_t, ngx_module_t, ngx_pagesize,
-    ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t, ngx_str_t, ngx_table_elt_t,
-    ngx_uint_t, off_t,
+    ngx_alloc_chain_link, ngx_array_t, ngx_buf_t, ngx_buf_tag_t, ngx_bufs_t, ngx_chain_add_copy,
+    ngx_chain_t, ngx_chain_update_chains, ngx_command_t, ngx_conf_check_num_bounds,
+    ngx_conf_num_bounds_t, ngx_conf_post_t, ngx_conf_set_bufs_slot, ngx_conf_set_flag_slot,
+    ngx_conf_set_num_slot, ngx_conf_set_size_slot, ngx_conf_t, ngx_create_temp_buf, ngx_cycle_t,
+    ngx_flag_t, ngx_hash_t, ngx_http_add_variable, ngx_http_conf_ctx_t,
+    ngx_http_html_default_types, ngx_http_merge_types, ngx_http_module, ngx_http_module_t,
+    ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
+    ngx_http_test_content_type, ngx_http_top_body_filter, ngx_http_top_header_filter,
+    ngx_http_types_slot, ngx_http_variable_value_t, ngx_int_t, ngx_list_push, ngx_log_t,
+    ngx_module_t, ngx_pagesize, ngx_palloc, ngx_parse_size, ngx_pcalloc, ngx_pnalloc, ngx_pool_t,
+    ngx_str_t, ngx_table_elt_t, ngx_uint_t, off_t,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug_mask, ngx_log_error, ngx_string};
 
@@ -258,8 +258,11 @@ fn module() -> &'static ngx_module_t {
 }
 
 /// Tags the output buffers this module owns, for `ngx_chain_update_chains`.
-fn buf_tag() -> *mut c_void {
-    (&raw mut ngx_http_brotli_filter_module).cast()
+///
+/// `ngx_buf_tag_t` is `void *` in NGINX and `uintptr_t` in freenginx; only `as`
+/// converts the module's address to both.
+fn buf_tag() -> ngx_buf_tag_t {
+    (&raw mut ngx_http_brotli_filter_module) as ngx_buf_tag_t
 }
 
 unsafe fn next_header_filter(r: *mut ngx_http_request_t) -> ngx_int_t {
