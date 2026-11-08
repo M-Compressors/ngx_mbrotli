@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.8 — 2026-11-08
+
+### Patch changes
+
+- [49e59a6](https://github.com/M-Compressors/ngx_mbrotli/commit/49e59a666e55600b85204e3ca194d01e6f7f5c60) The body filter now checks that the encoder never reports consuming more input or producing more output than the buffers it was given, before moving the buffers' pointers. A response that would break this fails with "brotli encoder failed: progress out of bounds" in the error log instead of sending memory past the end of an output buffer. mbrotli has never reported such counts, so responses are unchanged. — Thanks @Mnwa!
+
 ## 0.4.7 — 2026-11-07
 
 ### Patch changes
