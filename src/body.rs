@@ -234,6 +234,43 @@ impl From<ParallelProgress> for Outcome {
     }
 }
 
+impl Outcome {
+    /// Checks that the encoder stayed within the `input_len` bytes of input
+    /// and the `room` bytes of output it was given. The filter moves the
+    /// buffers' `pos` and `last` by these counts, which must not pass `last`
+    /// and `end`: mbrotli never reports more, but does not promise it.
+    const fn check_bounds(&self, input_len: usize, room: usize) -> Result<(), Overrun> {
+        if self.consumed > input_len || self.produced > room {
+            return Err(Overrun {
+                consumed: self.consumed,
+                input_len,
+                produced: self.produced,
+                room,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The encoder reported more progress than its buffers had room for.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Overrun {
+    consumed: usize,
+    input_len: usize,
+    produced: usize,
+    room: usize,
+}
+
+impl fmt::Display for Overrun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "progress out of bounds: consumed {} of {} input bytes, produced {} of {} output bytes",
+            self.consumed, self.input_len, self.produced, self.room
+        )
+    }
+}
+
 /// The state of one response's body filter.
 pub struct BodyFilter<H: Host> {
     host: H,
@@ -667,6 +704,9 @@ impl<H: Host> BodyFilter<H> {
                 .map_err(|err| err.to_string()),
         };
         let progress = outcome.map_err(|err| self.encode_error(&err))?;
+        progress
+            .check_bounds(input_len, room)
+            .map_err(|err| self.encode_error(&err))?;
 
         if progress.consumed > 0 {
             unsafe { (*self.in_buf).pos = (*self.in_buf).pos.add(progress.consumed) };

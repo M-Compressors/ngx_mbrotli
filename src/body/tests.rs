@@ -34,7 +34,9 @@ use ngx::ffi::{
     NGX_AGAIN, NGX_ERROR, NGX_OK, ngx_buf_t, ngx_buf_tag_t, ngx_chain_t, ngx_int_t, off_t,
 };
 
-use super::{BodyFilter, BufFlags, Host, Parallel, Settings, window_bits};
+use super::{
+    BodyFilter, BufFlags, Host, Outcome, Overrun, Parallel, Settings, Status, window_bits,
+};
 
 /// The request pool, the client and the connection, as the filter sees them.
 struct Model {
@@ -1018,4 +1020,82 @@ fn parallel_every_flushed_event_is_decodable_at_once() {
             stream_events(parallel_filter(budget, 2), split);
         }
     }
+}
+
+fn outcome(consumed: usize, produced: usize) -> Outcome {
+    Outcome {
+        consumed,
+        produced,
+        status: Status::NeedsInput,
+    }
+}
+
+/// Logs `overrun` the way `compress()` does and returns the message.
+fn logged(overrun: &Overrun) -> String {
+    let f = filter(None, 4, 4096);
+    f.encode_error(overrun);
+    let errors = f.host().errors.borrow();
+    assert_eq!(errors.len(), 1);
+    errors[0].clone()
+}
+
+#[test]
+fn progress_past_the_input_is_rejected() {
+    let overrun = outcome(101, 50).check_bounds(100, 4096).unwrap_err();
+    assert_eq!(
+        overrun,
+        Overrun {
+            consumed: 101,
+            input_len: 100,
+            produced: 50,
+            room: 4096,
+        }
+    );
+    assert_eq!(
+        logged(&overrun),
+        "brotli encoder failed: progress out of bounds: \
+         consumed 101 of 100 input bytes, produced 50 of 4096 output bytes"
+    );
+    assert!(outcome(1, 0).check_bounds(0, 0).is_err());
+    assert!(
+        outcome(usize::MAX, 0)
+            .check_bounds(usize::MAX - 1, 0)
+            .is_err()
+    );
+}
+
+#[test]
+fn progress_past_the_output_is_rejected() {
+    let overrun = outcome(100, 4097).check_bounds(100, 4096).unwrap_err();
+    assert_eq!(
+        overrun,
+        Overrun {
+            consumed: 100,
+            input_len: 100,
+            produced: 4097,
+            room: 4096,
+        }
+    );
+    assert_eq!(
+        logged(&overrun),
+        "brotli encoder failed: progress out of bounds: \
+         consumed 100 of 100 input bytes, produced 4097 of 4096 output bytes"
+    );
+    assert!(outcome(0, 1).check_bounds(0, 0).is_err());
+    assert!(
+        outcome(0, usize::MAX)
+            .check_bounds(0, usize::MAX - 1)
+            .is_err()
+    );
+}
+
+#[test]
+fn progress_up_to_the_ends_of_both_buffers_is_accepted() {
+    assert_eq!(outcome(100, 4096).check_bounds(100, 4096), Ok(()));
+    assert_eq!(outcome(0, 0).check_bounds(0, 0), Ok(()));
+    assert_eq!(outcome(99, 4095).check_bounds(100, 4096), Ok(()));
+    assert_eq!(
+        outcome(usize::MAX, usize::MAX).check_bounds(usize::MAX, usize::MAX),
+        Ok(())
+    );
 }
