@@ -1,5 +1,11 @@
 # ngx_mbrotli
 
+## 0.4.9 — 2026-11-13
+
+### Patch changes
+
+- [7ba1805](https://github.com/M-Compressors/ngx_mbrotli/commit/7ba1805e7e1ab613b25c5337610a79dd11c7e8bc) Update mbrotli to 0.5.22 — Thanks @Mnwa!
+
 ## 0.4.8 — 2026-11-08
 
 ### Patch changes
