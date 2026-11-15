@@ -154,7 +154,7 @@ jobs:
         with:
           pattern: package-*
           path: ${{ runner.temp }}/packages
-      - uses: cloudsmith-io/cloudsmith-cli-action@92b1383b22bbd36d804b858f273abcdf4d349f6b # v3.2.1
+      - uses: cloudsmith-io/cloudsmith-cli-action@b920b7ab61188faaa41ce9d5e803755463a25bfa # v3.2.2
         with:
           cli-version: 1.27.0
           oidc-namespace: m-compressors
